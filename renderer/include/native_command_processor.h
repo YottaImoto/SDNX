@@ -3,6 +3,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -11,6 +12,8 @@
 #include <type_traits>
 #include <map>
 #include <memory>
+#include <set>
+#include <utility>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -21,15 +24,41 @@
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
-#include <rex/ui/vulkan/api.h>
 
-namespace rex::ui::vulkan {
-class VulkanDevice;
-}
+#if defined(__SWITCH__)
+#include <switch/arm/counter.h>
+#endif
 
 namespace rex::graphics::sdnx {
 
-class VulkanBackend;
+// SDNX §16.141: a cheap timestamp for the per-draw timers (the system counter on the console: one register read;
+// steady_clock went through clock_gettime, ~3 % of the renderer thread). SdnxTicksToNs converts a difference.
+inline uint64_t SdnxTicks() {
+#if defined(__SWITCH__)
+  return armGetSystemTick();
+#else
+  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+}
+inline uint64_t SdnxTicksToNs(uint64_t ticks) {
+#if defined(__SWITCH__)
+  return armTicksToNs(ticks);
+#else
+  return ticks;
+#endif
+}
+
+// SDNX §16.139: free blocks indexed by offset (merging) and by size (best fit in O(log n)); the first-fit walk of the
+// offset map alone was ~6 % of the GPU thread with the hashed geometry buffer fragmented.
+struct FreeBlocks {
+  std::map<VkDeviceSize, VkDeviceSize> by_offset;
+  std::set<std::pair<VkDeviceSize, VkDeviceSize>> by_size;  // (size, offset)
+  void clear() {
+    by_offset.clear();
+    by_size.clear();
+  }
+};
 
 class NativeCommandProcessor : public CommandProcessor {
  public:
@@ -53,6 +82,9 @@ class NativeCommandProcessor : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet, uint32_t count) override;
+  // SDNX §16.132: time this thread waits for the guest (empty ring, WAIT_REG_MEM).
+  void PrepareForWait() override;
+  void ReturnFromWait() override;
 
  private:
   static constexpr uint32_t kFramesInFlight = 3;
@@ -60,14 +92,11 @@ class NativeCommandProcessor : public CommandProcessor {
   // A host image (all kept in VK_IMAGE_LAYOUT_GENERAL in this stage). `gpu`: made by the backend (image and view
   // below are its handles, kept while the frontend still records Vulkan commands itself); otherwise made here.
   struct Image {
-    GpuImage* gpu = nullptr;
-    VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkImageView view = VK_NULL_HANDLE;
+    GpuImage* gpu = nullptr;  // the backend's (opaque); null: no image
+    ImageDesc desc;           // what it was made with
     VkFormat format = VK_FORMAT_UNDEFINED;
-    VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     uint32_t width = 0, height = 0;
-    bool initialized = false;  // transitioned from UNDEFINED to GENERAL
+    bool initialized = false;  // cleared after creation (InitializeLayout)
     bool drawn = false;        // some draw targeted this image (diagnostic)
   };
 
@@ -76,7 +105,6 @@ class NativeCommandProcessor : public CommandProcessor {
   static uint64_t RenderTargetKey(uint32_t base_tiles, uint32_t pitch_pixels, uint32_t format,
                                   xenos::MsaaSamples msaa, bool is_depth);
 
-  const ui::vulkan::VulkanDevice* vulkan_device() const;
   bool CreateImage(Image& image, VkFormat format, uint32_t width, uint32_t height, bool depth);
   void DestroyImage(Image& image);
   // Image in GENERAL layout, at least width x height (recreated bigger if needed, contents lost).
@@ -92,9 +120,8 @@ class NativeCommandProcessor : public CommandProcessor {
   void FullBarrier(int line = __builtin_LINE(), const char* file = __builtin_FILE());
   // SDNX_LUMA_LOG: mean brightness of each presented frame, read back when its slot completes.
   struct LumaSlot {
-    VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    void* mapping = nullptr;
+    GpuBuffer* buffer = nullptr;
+    uint8_t* mapping = nullptr;
     VkDeviceSize size = 0;
     uint32_t width = 0, height = 0;
     uint64_t swap = 0;
@@ -104,13 +131,35 @@ class NativeCommandProcessor : public CommandProcessor {
   double luma_history_sum_ = 0.0;
   uint32_t luma_history_count_ = 0;
   uint64_t stats_total_swaps_ = 0;
+  // SDNX §16.139: byte range of the VS block (c0-c255, registers 0x4000-0x43FF) and of the PS block (c256-c479,
+  // 0x4400-0x477F) written since the last draw; with pushed constants only that range is compared with the copy
+  // already on the GPU (the mirrors) and only the registers that differ are pushed.
+  uint32_t vs_dirty_lo_ = 0, vs_dirty_hi_ = 4096, ps_dirty_lo_ = 0, ps_dirty_hi_ = 3584;
+  bool constant_mirrors_valid_ = false;
+  alignas(16) uint8_t vs_mirror_[4096] = {};
+  alignas(16) uint8_t ps_mirror_[3584] = {};
+  uint64_t constant_pushes_ = 0, constant_push_bytes_ = 0;
+  void NoteConstantWrites(uint32_t first, uint32_t count) {
+    const uint32_t end = first + count;
+    if (first < 0x4400 && end > 0x4000) {
+      vs_dirty_lo_ = std::min(vs_dirty_lo_, (std::max(first, 0x4000u) - 0x4000u) * 4);
+      vs_dirty_hi_ = std::max(vs_dirty_hi_, (std::min(end, 0x4400u) - 0x4000u) * 4);
+    }
+    if (first < 0x4780 && end > 0x4400) {
+      ps_dirty_lo_ = std::min(ps_dirty_lo_, (std::max(first, 0x4400u) - 0x4400u) * 4);
+      ps_dirty_hi_ = std::max(ps_dirty_hi_, (std::min(end, 0x4780u) - 0x4400u) * 4);
+    }
+  }
+  // SDNX §16.132: where this thread's time goes, printed every 30 swaps ([sdnx_cpu]).
+  uint64_t cpu_wait_start_ns_ = 0, cpu_idle_ns_ = 0, cpu_draw_ns_ = 0, cpu_copy_ns_ = 0, cpu_window_start_ns_ = 0;
+  uint64_t cpu_gpu_wait_base_ns_ = 0, cpu_window_draws_ = 0;
   void LumaRecord(const Image& front);
   void LumaCheck(uint32_t slot);
   void AttachmentBarrier();
-  void BeginPassBarrier(const VkImage* images, uint32_t count);
+  void BeginPassBarrier(GpuImage* const* images, uint32_t count);
   // Set by every transfer (copy, blit, clear, dispatch); a full barrier clears it (see BeginPassBarrier).
   bool transfer_pending_ = true;
-  std::vector<VkImage> attachments_written_;  // attachments of the passes since the last barrier
+  std::vector<const GpuImage*> attachments_written_;  // attachments of the passes since the last barrier
   std::unordered_map<std::string, uint64_t> barrier_sites_;  // SDNX_PROF: full barriers by call site
   // Depth resolve (k_24_8 / k_24_8_FLOAT textures): the depth aspect of the render target goes through the
   // upload buffer into an R32_SFLOAT resolved image (the [0, 1] depth, as the guest texture reads it); MSAA
@@ -126,26 +175,18 @@ class NativeCommandProcessor : public CommandProcessor {
   bool TryRestoreDepth(Shader* ps);
 
   void EnsureFrame();
-  bool SubmitFrame();
-  bool CreatePresentPipeline();
+  // Submits the open frame; with a front image, the backend first copies it into the presenter's guest output.
+  bool SubmitFrame(const Image* front = nullptr, uint32_t width = 0, uint32_t height = 0);
   void ReportStats();
 
   // The GPU backend (gpu_backend.h): frames, barriers and render-target images so far.
-  std::unique_ptr<VulkanBackend> backend_;
+  std::unique_ptr<GpuBackend> backend_;
   uint64_t frame_ = 0;
   bool frame_open_ = false;
-  VkCommandBuffer cb_ = VK_NULL_HANDLE;
 
   std::unordered_map<uint64_t, Image> render_targets_;
   std::unordered_map<uint32_t, Image> resolved_;  // by physical destination base
 
-  // Output: compute copy of the front buffer into the guest output image.
-  VkDescriptorSetLayout present_set_layout_ = VK_NULL_HANDLE;
-  VkPipelineLayout present_pipeline_layout_ = VK_NULL_HANDLE;
-  VkPipeline present_pipeline_ = VK_NULL_HANDLE;
-  VkDescriptorPool present_descriptor_pool_ = VK_NULL_HANDLE;
-  std::array<VkDescriptorSet, kFramesInFlight> present_sets_{};
-  VkSampler linear_sampler_ = VK_NULL_HANDLE;
 
   std::unordered_map<uint64_t, std::unique_ptr<Shader>> shaders_;
 
@@ -175,7 +216,6 @@ class NativeCommandProcessor : public CommandProcessor {
   };
   struct UploadBuffer {
     GpuBuffer* gpu = nullptr;
-    VkBuffer buffer = VK_NULL_HANDLE;  // gpu's (the draw still binds it directly)
     uint8_t* mapping = nullptr;
     VkDeviceSize size = 0, offset = 0;
   };
@@ -259,7 +299,7 @@ class NativeCommandProcessor : public CommandProcessor {
   uint32_t GetView(const Image& image, uint32_t heap, uint32_t levels, uint32_t layers, uint32_t swizzle,
                    uint32_t host_swizzle, VkFormat view_format = VK_FORMAT_UNDEFINED);
   // Views of an image being retired go with it (their heap indices are reused after the frame completes).
-  void RetireViews(VkImage image);
+  void RetireViews(const GpuImage* image);
   void ReleaseRetiredViews(uint32_t slot);
   static std::pair<uint32_t, uint32_t> PhysicalWriteCallback(void* context, uint32_t start, uint32_t length,
                                                             bool exact);
@@ -293,7 +333,7 @@ class NativeCommandProcessor : public CommandProcessor {
   std::unordered_map<uint32_t, uint32_t> resolved_extent_;  // destination base -> bytes the resolve covers  // by destination base, bumped by every resolve
   std::unordered_map<uint64_t, Texture> textures_;
   std::unordered_map<uint64_t, TextureView> views_;                  // (image, heap, swizzle) -> view
-  std::unordered_map<VkImage, std::vector<uint64_t>> image_views_;  // image -> keys in views_
+  std::unordered_map<const GpuImage*, std::vector<uint64_t>> image_views_;  // image -> keys in views_
   std::array<std::vector<TextureView>, kFramesInFlight> retired_views_;
   std::vector<uint32_t> free_indices_[3];
   uint32_t next_index_[3] = {1, 1, 1};
@@ -366,7 +406,7 @@ class NativeCommandProcessor : public CommandProcessor {
   };
   GpuBuffer* hashed_gpu_ = nullptr;
   uint8_t* hashed_mapping_ = nullptr;
-  std::map<VkDeviceSize, VkDeviceSize> hashed_free_;
+  FreeBlocks hashed_free_;  // §16.139
   std::array<std::vector<std::pair<VkDeviceSize, VkDeviceSize>>, kFramesInFlight> hashed_retired_;
   FlatMap64<HashedGeometry> hashed_;  // flat: several lookups per draw in ~20-30k entries
   // The entry of `key` holding `content` (allocated and filled by `fill` when absent or different), or nullptr.
@@ -385,10 +425,6 @@ class NativeCommandProcessor : public CommandProcessor {
   void EndHostQuery();
   void ResetQueries(uint32_t slot);      // after the slot's fence: results to query_results_, pool reset
   void CopyQueryResults(uint32_t slot);  // before the frame's submit
-  std::array<VkQueryPool, kFramesInFlight> query_pools_{};
-  std::array<VkBuffer, kFramesInFlight> query_readback_{};
-  std::array<VkDeviceMemory, kFramesInFlight> query_readback_memory_{};
-  std::array<const uint64_t*, kFramesInFlight> query_readback_mapping_{};
   std::array<uint32_t, kFramesInFlight> query_used_{};
   struct PendingQuery {
     uint32_t address;
@@ -421,9 +457,8 @@ class NativeCommandProcessor : public CommandProcessor {
   void DumpResolveIfRequested(uint32_t dest_base, const Image& dest);
   bool dump_nth_frame_ = false;
   uint32_t dump_nth_count_ = 0;
-  VkBuffer dump_buffer_ = VK_NULL_HANDLE;
-  VkDeviceMemory dump_memory_ = VK_NULL_HANDLE;
-  void* dump_mapping_ = nullptr;
+  GpuBuffer* dump_buffer_ = nullptr;
+  uint8_t* dump_mapping_ = nullptr;
   VkDeviceSize dump_size_ = 0;
   uint32_t dump_width_ = 0, dump_height_ = 0, dump_bpp_ = 0;
   bool dump_float_ = false;  // R32_SFLOAT (depth resolves): the value as grey, its range in the log
@@ -436,6 +471,7 @@ class NativeCommandProcessor : public CommandProcessor {
   // Diagnostic: SDNX_LOG_FRAME=N logs every draw, resolve and clear of swap N (counted from the first swap).
   uint64_t swap_count_ = 0;
   bool log_frame_ = false;
+  uint32_t stencil_probes_ = 0;  // §16.108: depth/stencil probes before stencil-EQUAL draws in this frame log
   uint32_t log_draw_ = 0;
 };
 

@@ -23,6 +23,8 @@
 "0x8261ED88" = { share_registers = true }
 "0x8261EE00" = { share_registers = true }
 "0x82634DA0" = { }
+"0x827050C0" = { }  # stub between sub_827050A0 (ends with a tail call at 0x827050BC) and sub_827050E0, same shape as both, reached only through a pointer (crash after ~9 min of play, 2026-11-19)
+"0x82768930" = { }  # small method between the vtable thunk sub_82768920 (ends 0x8276892C) and sub_82768938, reached only through a pointer (crash on ZL, 2026-11-18)
 "0x829107A0" = { }  # vtable forwarding thunk (lwz r3,0(r4) .. bctr) reached only through a pointer (crash 2026-11-09)
 "0x829107C8" = { }
 "0x829107E0" = { }

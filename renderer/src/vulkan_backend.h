@@ -2,8 +2,7 @@
  * Sleeping Dogs port (SDNX): the Vulkan backend of the native renderer (PC bench, NVK on the Switch).
  * See rex/graphics/sdnx/gpu_backend.h.
  *
- * Migration in steps (portlog 16.47): frames, barriers, images and buffers are here; the frontend still records the
- * other commands into command_buffer() directly until they move behind the interface too.
+ * Everything the frontend records goes through it (portlog 16.47-16.51).
  */
 #pragma once
 
@@ -14,6 +13,9 @@
 #include <rex/graphics/sdnx/gpu_backend.h>
 #include <rex/ui/vulkan/api.h>
 
+namespace rex::ui {
+class Presenter;
+}
 namespace rex::ui::vulkan {
 class VulkanDevice;
 }
@@ -45,7 +47,8 @@ struct GpuShader {
 
 class VulkanBackend final : public GpuBackend {
  public:
-  explicit VulkanBackend(const ui::vulkan::VulkanDevice* device) : device_(device) {}
+  VulkanBackend(const ui::vulkan::VulkanDevice* device, ui::Presenter* presenter)
+      : device_(device), presenter_(presenter) {}
   ~VulkanBackend() override;
 
   bool Initialize() override;
@@ -107,17 +110,15 @@ class VulkanBackend final : public GpuBackend {
   bool Present(uint32_t slot, GpuImage* front, uint32_t front_width, uint32_t front_height, uint32_t width,
                uint32_t height, bool is_8bpc) override;
 
-  // Transitional (until every command is behind the interface): the command buffer being recorded, the device, the
-  // bindless heap sets 0-3 and their layouts (the frontend still makes the draw pipeline layout and binds them).
-  VkCommandBuffer command_buffer() const { return cb_; }
-  const ui::vulkan::VulkanDevice* device() const { return device_; }
-  // Statistics (SDNX_PROF): draws whose constants set stayed bound.
-  uint64_t constants_bind_skipped() const { return constants_bind_skipped_; }
+  uint64_t constants_bind_skipped() const override { return constants_bind_skipped_; }
 
  private:
   void NotYet(const char* what) const;
+  bool CreateQueries();
+  bool CreatePresentPipeline();
 
   const ui::vulkan::VulkanDevice* device_;
+  ui::Presenter* presenter_;
   VkCommandPool command_pool_ = VK_NULL_HANDLE;
   std::array<VkCommandBuffer, kFramesInFlight> command_buffers_{};
   std::array<VkFence, kFramesInFlight> fences_{};
@@ -132,6 +133,18 @@ class VulkanBackend final : public GpuBackend {
   VkDescriptorSet heap_sets_[4] = {};
   std::vector<VkSampler> samplers_;  // by sampler index (VK_NULL_HANDLE: not written)
   std::unordered_map<int, bool> filterable_;
+
+  // Occlusion queries: a pool and a readback buffer per frame slot (none if they could not be made).
+  std::array<VkQueryPool, kFramesInFlight> query_pools_{};
+  std::array<GpuBuffer*, kFramesInFlight> query_readback_{};
+
+  // Output: compute copy of the front image into the presenter's guest output image.
+  VkDescriptorSetLayout present_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout present_pipeline_layout_ = VK_NULL_HANDLE;
+  VkPipeline present_pipeline_ = VK_NULL_HANDLE;
+  VkDescriptorPool present_descriptor_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kFramesInFlight> present_sets_{};
+  VkSampler linear_sampler_ = VK_NULL_HANDLE;
 
   VkDescriptorSetLayout constants_layout_ = VK_NULL_HANDLE;
   VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;

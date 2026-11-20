@@ -30,11 +30,13 @@ docker_cmd() {
 echo "== build $NRO_OUT (-j$JOBS)"
 docker_cmd run --rm -v "$ME:$ME" -v "$MESA:$MESA:ro" -w "$ME" \
   -e ME="$ME" -e MESA="$MESA" -e NRO_OUT="$NRO_OUT" -e JOBS="$JOBS" -e GUEST_VOLATILE="$GUEST_VOLATILE" \
+  -e SDNX_DEKO3D_DEBUG="${SDNX_DEKO3D_DEBUG:-OFF}" \
   devkitpro/devkita64:latest bash -euo pipefail -c '
     cmake -S sdretail -B "$NRO_OUT" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$ME/tools/switch/cmake/switch-devkitA64.cmake" \
       -DDEVKITPRO=/opt/devkitpro \
       -DSDRETAIL_GUEST_VOLATILE="$GUEST_VOLATILE" \
+      -DSDNX_DEKO3D_DEBUG="${SDNX_DEKO3D_DEBUG:-OFF}" \
       -DREXGLUE_SWITCH_NVK_SDK="$MESA/opt/devkitpro/portlibs/switch" > "$NRO_OUT.configure.log" 2>&1 \
       || { tail -40 "$NRO_OUT.configure.log"; exit 1; }
     cmake --build "$NRO_OUT" -j "$JOBS"

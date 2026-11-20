@@ -11,7 +11,6 @@
  */
 #include <rex/graphics/sdnx/native_command_processor.h>
 
-#include "vulkan_backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -33,8 +32,6 @@
 #include <rex/memory.h>
 #include <rex/string/buffer.h>
 #include <rex/system/xmemory.h>
-#include <rex/ui/vulkan/device.h>
-#include <rex/ui/vulkan/util.h>
 
 namespace rex::graphics::sdnx {
 
@@ -239,24 +236,38 @@ void NativeCommandProcessor::ShutdownTextures() {
 
 std::pair<uint32_t, uint32_t> NativeCommandProcessor::PhysicalWriteCallback(void* context, uint32_t start,
                                                                             uint32_t length, bool exact) {
-  (void)exact;
   auto* self = static_cast<NativeCommandProcessor*>(context);
-  if (length) {
-    uint32_t first = (start & 0x1FFFFFFFu) >> kPageSizeLog2;
-    uint32_t last = std::min(((start & 0x1FFFFFFFu) + length - 1) >> kPageSizeLog2, kPhysicalPages - 1);
-    uint32_t frame = self->callback_frame_.load(std::memory_order_relaxed);
-    for (uint32_t page = first; page <= last; ++page) {
-      self->page_versions_[page].fetch_add(1, std::memory_order_relaxed);
-      self->page_write_frame_[page].store(frame, std::memory_order_relaxed);
-      uint8_t strikes = self->page_strikes_[page].load(std::memory_order_relaxed);
-      if (strikes < 16) self->page_strikes_[page].store(strikes + 1, std::memory_order_relaxed);
-    }
-    self->write_epoch_.fetch_add(1, std::memory_order_release);
-    self->write_callbacks_.fetch_add(1, std::memory_order_relaxed);
+  if (!length) return {start, length};
+  // §16.136: the memory system unwatches the range returned here (unless `exact`). Only the written pages used to be
+  // returned, so a write into the middle of a watched texture split its run of protected pages: after leaving
+  // gameplay the game rewrote the unloaded world's memory piecemeal, the watched pages became a checkerboard of
+  // ~14,000 kernel memory blocks, Horizon ran out of them (svc 0xCE01) and the next unprotect failed - the guest's
+  // write was then an unhandled fault (crash on "continue" from the main menu). Now the whole aligned granule around
+  // the write is unwatched, and every page of it is marked written (its version bumped), so a texture or vertex
+  // range there is checked again on its next use and re-watched whole: nothing goes unnoticed (returning a wider
+  // range without bumping is what left stale glyphs and logos before).
+  constexpr uint32_t kGranule = 64 * 1024;
+  const uint32_t phys = start & 0x1FFFFFFFu;
+  const uint32_t write_first = phys >> kPageSizeLog2;
+  const uint32_t write_last = std::min((phys + length - 1) >> kPageSizeLog2, kPhysicalPages - 1);
+  uint32_t first = write_first, last = write_last;
+  if (!exact) {
+    first = (phys & ~(kGranule - 1)) >> kPageSizeLog2;
+    last = std::min(((phys + length - 1) | (kGranule - 1)) >> kPageSizeLog2, kPhysicalPages - 1);
   }
-  // Only the written pages may be unwatched: returning (0, UINT32_MAX) lets the memory system unprotect up to
-  // 4 MB around the write, and later writes to other textures there would go unnoticed (stale glyphs, logos).
-  return {start, length};
+  const uint32_t frame = self->callback_frame_.load(std::memory_order_relaxed);
+  for (uint32_t page = first; page <= last; ++page) {
+    self->page_versions_[page].fetch_add(1, std::memory_order_relaxed);
+    if (page < write_first || page > write_last) continue;  // only really written pages count as hot
+    self->page_write_frame_[page].store(frame, std::memory_order_relaxed);
+    uint8_t strikes = self->page_strikes_[page].load(std::memory_order_relaxed);
+    if (strikes < 16) self->page_strikes_[page].store(strikes + 1, std::memory_order_relaxed);
+  }
+  self->write_epoch_.fetch_add(1, std::memory_order_release);
+  self->write_callbacks_.fetch_add(1, std::memory_order_relaxed);
+  if (exact) return {start, length};
+  const uint32_t high = start & ~0x1FFFFFFFu;
+  return {high | (first << kPageSizeLog2), (last - first + 1) << kPageSizeLog2};
 }
 
 uint64_t NativeCommandProcessor::PagesVersion(uint32_t first, uint32_t count) const {
@@ -285,7 +296,7 @@ uint32_t NativeCommandProcessor::GetView(const Image& image, uint32_t heap, uint
                                          uint32_t swizzle, uint32_t host_swizzle, VkFormat view_format) {
   if (view_format == VK_FORMAT_UNDEFINED) view_format = image.format;
   last_texture_format_ = view_format;
-  uint64_t key_data[3] = {uint64_t(reinterpret_cast<uintptr_t>(image.image)), uint64_t(heap) | uint64_t(levels) << 8,
+  uint64_t key_data[3] = {uint64_t(reinterpret_cast<uintptr_t>(image.gpu)), uint64_t(heap) | uint64_t(levels) << 8,
                           uint64_t(swizzle) | uint64_t(host_swizzle) << 16 | uint64_t(view_format) << 32};
   uint64_t key = XXH3_64bits(key_data, sizeof(key_data));
   auto it = views_.find(key);
@@ -328,11 +339,11 @@ uint32_t NativeCommandProcessor::GetView(const Image& image, uint32_t heap, uint
   }
   backend_->WriteImageDescriptor(desc.type, index, view.view);
   views_.emplace(key, view);
-  image_views_[image.image].push_back(key);
+  image_views_[image.gpu].push_back(key);
   return index;
 }
 
-void NativeCommandProcessor::RetireViews(VkImage image) {
+void NativeCommandProcessor::RetireViews(const GpuImage* image) {
   auto it = image_views_.find(image);
   if (it == image_views_.end()) return;
   std::vector<TextureView>& retired = retired_views_[uint32_t(frame_ % kFramesInFlight)];
@@ -387,7 +398,7 @@ uint32_t NativeCommandProcessor::GetSamplerDescriptor(const xenos::xe_gpu_textur
                 uint32_t(min), uint32_t(mip), uint32_t(fetch.clamp_x), uint32_t(fetch.clamp_y),
                 uint32_t(fetch.clamp_z), uint32_t(fetch.border_color), bias);
   }
-  if (sampler_count_ + 1 >= kHeapSize) return 0;
+  if (sampler_count_ + 1 >= GpuBackend::kHeapSize) return 0;
 
   SamplerDesc desc;
   desc.mag_linear = mag == TextureFilter::kLinear;
@@ -519,7 +530,17 @@ bool NativeCommandProcessor::LoadTexture(Texture& texture, const xenos::xe_gpu_t
             }
             uint8_t* to = out + ((size_t(z) * lbh + y) * lbw + x) * bpb;
             if (at + bpb <= extent) {
-              std::memcpy(to, swapped.data() + at, bpb);
+              // §16.139: fixed sizes are inlined as one or two loads/stores; a libc call per 4-16 byte block was
+              // ~6 % of the GPU thread.
+              const uint8_t* from = swapped.data() + at;
+              switch (bpb) {
+                case 1: *to = *from; break;
+                case 2: std::memcpy(to, from, 2); break;
+                case 4: std::memcpy(to, from, 4); break;
+                case 8: std::memcpy(to, from, 8); break;
+                case 16: std::memcpy(to, from, 16); break;
+                default: std::memcpy(to, from, bpb); break;
+              }
             } else {
               std::memset(to, 0, bpb);
             }
@@ -599,13 +620,13 @@ bool NativeCommandProcessor::LoadTexture(Texture& texture, const xenos::xe_gpu_t
 
   // The host image (recreated when the size or format changes).
   Image& image = texture.image;
-  if (image.image &&
+  if (image.gpu &&
       (image.format != host.format || image.width != width || image.height != height || texture.levels != levels ||
        texture.layers != layers || texture.depth != depth)) {
     RetireImage(image);
   }
   EndRendering();
-  if (!image.image) {
+  if (!image.gpu) {
     ImageDesc desc;
     desc.type = cube ? ImageType::kCube : (is_3d ? ImageType::k3D : ImageType::k2D);
     desc.format = host.format;
@@ -622,9 +643,7 @@ bool NativeCommandProcessor::LoadTexture(Texture& texture, const xenos::xe_gpu_t
       REXGPU_ERROR("[sdnx_native] could not create a {}x{} texture (format {})", width, height, uint32_t(format));
       return false;
     }
-    image.image = image.gpu->image;
-    image.view = image.gpu->view;
-    image.aspect = image.gpu->aspect;
+    image.desc = desc;
     image.format = host.format;
     image.width = width;
     image.height = height;
@@ -680,7 +699,7 @@ uint64_t NativeCommandProcessor::TextureContentHash(const Texture& texture) {
 }
 
 bool NativeCommandProcessor::OverlayResolvedFaces(Texture& texture, const xenos::xe_gpu_texture_fetch_t& fetch) {
-  if (!texture.loaded || !texture.image.image || texture.layers != 6) return false;
+  if (!texture.loaded || !texture.image.gpu || texture.layers != 6) return false;
   uint32_t width_minus_1, height_minus_1, depth_minus_1, base_page, mip_page, mip_min, mip_max;
   texture_util::GetSubresourcesFromFetchConstant(fetch, &width_minus_1, &height_minus_1, &depth_minus_1, &base_page,
                                                  &mip_page, &mip_min, &mip_max);
@@ -695,7 +714,7 @@ bool NativeCommandProcessor::OverlayResolvedFaces(Texture& texture, const xenos:
   for (uint32_t f = 0; f < 6; ++f) {
     uint32_t address = base_address + f * stride;
     auto it = resolved_.find(address);
-    if (it == resolved_.end() || !it->second.image || it->second.format != texture.image.format ||
+    if (it == resolved_.end() || !it->second.gpu || it->second.format != texture.image.format ||
         it->second.width < width || it->second.height < height) {
       continue;
     }
@@ -745,7 +764,7 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
 
   // Render to texture: the resolved image of that address.
   auto resolved = heap == 0 ? resolved_.find(base_page << kPageSizeLog2) : resolved_.end();
-  if (resolved != resolved_.end() && resolved->second.image) {
+  if (resolved != resolved_.end() && resolved->second.gpu) {
     ++stats_.tex_resolved;
     static const bool trace_resolve = std::getenv("SDNX_TRACE_RESOLVE") != nullptr;
     static std::unordered_map<uint64_t, int> traced;
@@ -783,7 +802,7 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
         const uint64_t base_frame = resolved_frame_[base_address];
         std::vector<ResolvedPart> parts;
         for (const auto& other : resolved_) {
-          if (!other.second.image || other.second.format != source->format) continue;
+          if (!other.second.gpu || other.second.format != source->format) continue;
           if (other.first < base_address || other.first >= base_address + row_bytes * th) continue;
           // (A filter keeping only parts resolved in the frame of the base or the one before was tried against the
           // right-edge strip, which it did not fix; it is suspected of the white half-screen flashes seen on the
@@ -806,8 +825,8 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
           copy.generation = ~0ull;
         }
       }
-      if (copy.image.image && copy.image.format != source->format) RetireImage(copy.image);
-      if (!copy.image.image) {
+      if (copy.image.gpu && copy.image.format != source->format) RetireImage(copy.image);
+      if (!copy.image.gpu) {
         EndRendering();
         if (!CreateImage(copy.image, source->format, tw, th, false)) {
           resolved_copies_.erase(copy_key);
@@ -823,7 +842,7 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
         FullBarrier();
         for (const ResolvedPart& part : copy.parts) {
           auto part_it = resolved_.find(part.address);
-          if (part_it == resolved_.end() || !part_it->second.image) continue;
+          if (part_it == resolved_.end() || !part_it->second.gpu) continue;
           ImageRegion from, to;
           from.width = to.width = std::min(tw - part.x, part_it->second.width);
           from.height = to.height = std::min(th - part.y, part_it->second.height);
@@ -933,7 +952,7 @@ void NativeCommandProcessor::EvictTextures() {
     // A texture loaded but never revalidated has validated_frame unset: give it the same time from its load.
     if (texture.validated_frame == ~0ull && texture.loaded) texture.validated_frame = frame_;
     if (stale && (texture.validated_frame != frame_ || !texture.loaded)) {
-      if (texture.image.image) RetireImage(texture.image);
+      if (texture.image.gpu) RetireImage(texture.image);
       it = textures_.erase(it);
       ++evicted;
     } else {

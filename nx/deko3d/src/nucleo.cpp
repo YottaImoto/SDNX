@@ -136,7 +136,12 @@ DkMemBlock Dispositivo::CrearBloque(uint32_t bytes, uint32_t flags, const char* 
   DkMemBlockMaker m;
   dkMemBlockMakerDefaults(&m, dispositivo_, bytes);
   m.flags = flags;
-  return dkMemBlockCreate(&m);
+  DkMemBlock bloque = dkMemBlockCreate(&m);
+  // GPU range of the block: a GPU page fault address is matched against these lines (SDNX §16.87).
+  const DkGpuAddr gpu = dkMemBlockGetGpuAddr(bloque);
+  Registro("[dk]   %s: gpu 0x%010llx..0x%010llx", nombre, static_cast<unsigned long long>(gpu),
+           static_cast<unsigned long long>(gpu + bytes));
+  return bloque;
 }
 
 void Dispositivo::DestruirBloque(DkMemBlock bloque) {
@@ -218,6 +223,7 @@ void Nucleo::Crear(Dispositivo& disp, const ConfigNucleo& config) {
   disp_ = &disp;
   config_ = config;
   config_.ranuras = std::max<uint32_t>(config_.ranuras, 1);
+  config_.envios_en_vuelo = std::min<uint32_t>(std::max<uint32_t>(config_.envios_en_vuelo, 2), kVallasEnvio);
   config_.kb_comandos = std::max<uint32_t>(Alinear(config_.kb_comandos, kTrozoComandos >> 10), kTrozoComandos >> 10);
 
   DkCmdBufMaker cm;
@@ -237,7 +243,11 @@ void Nucleo::Crear(Dispositivo& disp, const ConfigNucleo& config) {
     memoria_previos_ =
         CrearBloque(n * (config_.kb_previos << 10), kSinCacheCpu, "memoria de la lista previa (por ranura)");
   }
-  subida_ = CrearBloque(n * (config_.mb_subida << 20), kSinCacheCpu, "anillo de subida (por ranura)");
+  subida_ = CrearBloque(n * (config_.mb_subida << 20),
+                        config_.subida_cacheada ? (DkMemBlockFlags_CpuCached | DkMemBlockFlags_GpuCached)
+                                                : kSinCacheCpu,
+                        config_.subida_cacheada ? "anillo de subida (por ranura, cache de CPU)"
+                                                : "anillo de subida (por ranura)");
   subida_cpu_ = static_cast<uint8_t*>(dkMemBlockGetCpuAddr(subida_));
   subida_gpu_ = dkMemBlockGetGpuAddr(subida_);
   codigo_ = CrearBloque(config_.mb_codigo << 20, kSinCacheCpu | DkMemBlockFlags_Code, "codigo de shaders");
@@ -314,6 +324,7 @@ void Nucleo::EmpezarTrabajo(uint64_t trabajo) {
   }
   r.por_liberar.clear();
   r.subida_usada = 0;
+  r.subida_limpia = 0;
   // dkCmdBufClear rewinds to the start of the last piece of memory given (deko3d 0.5.0), which belongs to another
   // slot: the slot's first piece is given again explicitly, as deko_examples' CCmdMemRing does.
   dkCmdBufClear(comandos_);
@@ -379,10 +390,41 @@ DkCmdList Nucleo::CerrarPrevios() {
   return dkCmdBufFinishList(previos_);
 }
 
+// SDNX §16.106: bounds what the GPU has not fetched yet to config_.envios_en_vuelo submits (§16.133) (see nucleo.h). Records this
+// submit's fence (no cache flush: only how far the GPU got matters) and waits for the one that many back.
+void Nucleo::MarcarEnvio() {
+  if (envios_ >= config_.envios_en_vuelo) {
+    DkFence& anterior = vallas_envio_[(envios_ - config_.envios_en_vuelo) % kVallasEnvio];
+    if (dkFenceWait(&anterior, 0) != DkResult_Success) {
+      ++esperas_envio_;
+      const uint64_t antes = AhoraNs();
+      while (dkFenceWait(&anterior, 2'000'000'000ll) != DkResult_Success) {
+        disp_->ComprobarCola("esperar un envio anterior");
+      }
+      ns_esperando_valla_ += AhoraNs() - antes;
+    }
+  }
+  dkCmdBufSignalFence(comandos_, &vallas_envio_[envios_ % kVallasEnvio], false);
+  ++envios_;
+}
+
+void Nucleo::LimpiarSubida() {
+  if (!config_.subida_cacheada || !abierto_) return;
+  Ranura& r = ranuras_[ranura_];
+  if (r.subida_usada <= r.subida_limpia) return;
+  const uint32_t rebanada = config_.mb_subida << 20;
+  const uint32_t desde = r.subida_limpia & ~63u;
+  dkMemBlockFlushCpuCache(subida_, ranura_ * rebanada + desde, r.subida_usada - desde);
+  bytes_limpiados_ += r.subida_usada - desde;
+  r.subida_limpia = r.subida_usada;
+}
+
 void Nucleo::TerminarTrabajo() {
   Ranura& r = ranuras_[ranura_];
+  LimpiarSubida();  // §16.141: before the GPU can read the ring
   const DkCmdList previa = CerrarPrevios();
   dkCmdBufSignalFence(comandos_, &r.valla, true);
+  MarcarEnvio();
   r.vallada = true;
   if (previa) {
     disp_->Enviar(previa, dkCmdBufFinishList(comandos_), "enviar un trabajo");
@@ -396,7 +438,9 @@ void Nucleo::TerminarTrabajo() {
 }
 
 void Nucleo::EnviarParcial() {
+  LimpiarSubida();  // §16.141
   const DkCmdList previa = CerrarPrevios();
+  MarcarEnvio();
   if (previa) {
     disp_->Enviar(previa, dkCmdBufFinishList(comandos_), "un envio parcial");
   } else {
@@ -627,7 +671,8 @@ void Presentacion::Crear(Dispositivo& disp, uint32_t ancho, uint32_t alto, uint3
   alto_ = alto;
   DkImageLayoutMaker lm;
   dkImageLayoutMakerDefaults(&lm, disp.dispositivo());
-  lm.flags = DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_HwCompression;
+  lm.flags = DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_Usage2DEngine |
+             DkImageFlags_HwCompression;
   lm.format = DkImageFormat_RGBA8_Unorm;
   lm.dimensions[0] = ancho;
   lm.dimensions[1] = alto;

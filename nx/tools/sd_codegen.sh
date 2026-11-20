@@ -45,6 +45,8 @@ echo "hooked: $(paste -sd' ' "$TOOLS_SD/hooked.txt")"
 python3 "$TOOLS_SD/direct_calls.py" --gen "$GEN" --undo > /dev/null
 python3 "$TOOLS_SD/direct_calls.py" --gen "$GEN" --hooked-list "$TOOLS_SD/hooked.txt"
 python3 "$TOOLS_SD/pch_no_volatile.py" "$GEN/sdretail_pch.h"
+# SDNX 16.146: the hot functions of the CPU profile without volatile (nx/sdretail/hot_nonvolatile.txt).
+python3 /mnt/d/CODE/SDNX/nx/tools/hot_no_volatile.py "$GEN" "$SRC/hot_nonvolatile.txt"
 
 echo "== register-use checks (read_before_write.py)"
 # Expected (2026-11-08, see perf_overrides.toml): non-volatile = 5 harmless functions; --volatile = none.

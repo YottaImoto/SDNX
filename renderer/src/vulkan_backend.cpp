@@ -4,12 +4,18 @@
 
 #include "vulkan_backend.h"
 
+#include "shaders/present_cs.h"
+
 #include <algorithm>
 #include <unordered_set>
 
 #include <rex/hash.h>
 #include <rex/logging.h>
+#include <rex/ui/presenter.h>
+#include <rex/graphics/graphics_system.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/provider.h>
+#include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
 namespace rex::graphics::sdnx {
@@ -141,7 +147,85 @@ bool VulkanBackend::Initialize() {
     info.pPoolSizes = sizes;
     if (dfn.vkCreateDescriptorPool(device_->device(), &info, nullptr, &constants_pool_) != VK_SUCCESS) return false;
   }
+  if (!CreateQueries()) {
+    REXGPU_WARN("[sdnx_vk] occlusion queries unavailable: fixed counts (everything visible)");
+  }
+  if (!CreatePresentPipeline()) {
+    REXGPU_ERROR("[sdnx_vk] could not create the output pipeline");
+    return false;
+  }
   return true;
+}
+
+bool VulkanBackend::CreateQueries() {
+  const ui::vulkan::VulkanDevice::Functions& dfn = device_->functions();
+  for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
+    VkQueryPoolCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    info.queryType = VK_QUERY_TYPE_OCCLUSION;
+    info.queryCount = kMaxQueries;
+    if (dfn.vkCreateQueryPool(device_->device(), &info, nullptr, &query_pools_[slot]) != VK_SUCCESS) {
+      query_pools_[slot] = VK_NULL_HANDLE;
+      return false;
+    }
+    query_readback_[slot] = CreateBuffer(sizeof(uint64_t) * kMaxQueries, BufferUsage::kReadback, nullptr);
+    if (!query_readback_[slot]) return false;
+  }
+  return true;
+}
+
+bool VulkanBackend::CreatePresentPipeline() {
+  const ui::vulkan::VulkanDevice::Functions& dfn = device_->functions();
+  VkDescriptorSetLayoutBinding bindings[3] = {};
+  bindings[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  bindings[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  VkDescriptorSetLayoutCreateInfo set_info = {};
+  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  set_info.bindingCount = 3;
+  set_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device_->device(), &set_info, nullptr, &present_set_layout_) != VK_SUCCESS) {
+    return false;
+  }
+  VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+  VkPipelineLayoutCreateInfo layout_info = {};
+  layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  layout_info.setLayoutCount = 1;
+  layout_info.pSetLayouts = &present_set_layout_;
+  layout_info.pushConstantRangeCount = 1;
+  layout_info.pPushConstantRanges = &push;
+  if (dfn.vkCreatePipelineLayout(device_->device(), &layout_info, nullptr, &present_pipeline_layout_) != VK_SUCCESS) {
+    return false;
+  }
+  present_pipeline_ = ui::vulkan::util::CreateComputePipeline(device_, present_pipeline_layout_, shaders::kPresentCs,
+                                                              sizeof(shaders::kPresentCs));
+  if (present_pipeline_ == VK_NULL_HANDLE) return false;
+  VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kFramesInFlight},
+                                   {VK_DESCRIPTOR_TYPE_SAMPLER, kFramesInFlight},
+                                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kFramesInFlight}};
+  VkDescriptorPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  pool_info.maxSets = kFramesInFlight;
+  pool_info.poolSizeCount = 3;
+  pool_info.pPoolSizes = sizes;
+  if (dfn.vkCreateDescriptorPool(device_->device(), &pool_info, nullptr, &present_descriptor_pool_) != VK_SUCCESS) {
+    return false;
+  }
+  std::array<VkDescriptorSetLayout, kFramesInFlight> layouts;
+  layouts.fill(present_set_layout_);
+  VkDescriptorSetAllocateInfo alloc = {};
+  alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+  alloc.descriptorPool = present_descriptor_pool_;
+  alloc.descriptorSetCount = kFramesInFlight;
+  alloc.pSetLayouts = layouts.data();
+  if (dfn.vkAllocateDescriptorSets(device_->device(), &alloc, present_sets_.data()) != VK_SUCCESS) return false;
+  VkSamplerCreateInfo sampler = {};
+  sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+  sampler.magFilter = VK_FILTER_LINEAR;
+  sampler.minFilter = VK_FILTER_LINEAR;
+  sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sampler.maxLod = 0.0f;
+  return dfn.vkCreateSampler(device_->device(), &sampler, nullptr, &linear_sampler_) == VK_SUCCESS;
 }
 
 uint64_t VulkanBackend::MaxStorageBufferRange() const { return device_->properties().maxStorageBufferRange; }
@@ -183,6 +267,22 @@ void VulkanBackend::Shutdown() {
   if (!command_pool_) return;
   const ui::vulkan::VulkanDevice::Functions& dfn = device_->functions();
   dfn.vkDeviceWaitIdle(device_->device());
+  if (linear_sampler_) dfn.vkDestroySampler(device_->device(), linear_sampler_, nullptr);
+  linear_sampler_ = VK_NULL_HANDLE;
+  if (present_descriptor_pool_) dfn.vkDestroyDescriptorPool(device_->device(), present_descriptor_pool_, nullptr);
+  present_descriptor_pool_ = VK_NULL_HANDLE;
+  if (present_pipeline_) dfn.vkDestroyPipeline(device_->device(), present_pipeline_, nullptr);
+  present_pipeline_ = VK_NULL_HANDLE;
+  if (present_pipeline_layout_) dfn.vkDestroyPipelineLayout(device_->device(), present_pipeline_layout_, nullptr);
+  present_pipeline_layout_ = VK_NULL_HANDLE;
+  if (present_set_layout_) dfn.vkDestroyDescriptorSetLayout(device_->device(), present_set_layout_, nullptr);
+  present_set_layout_ = VK_NULL_HANDLE;
+  for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
+    if (query_pools_[slot]) dfn.vkDestroyQueryPool(device_->device(), query_pools_[slot], nullptr);
+    query_pools_[slot] = VK_NULL_HANDLE;
+    DestroyBuffer(query_readback_[slot]);
+    query_readback_[slot] = nullptr;
+  }
   for (auto& it : pipelines_) dfn.vkDestroyPipeline(device_->device(), it.second, nullptr);
   pipelines_.clear();
   constants_sets_.clear();
@@ -918,20 +1018,96 @@ bool VulkanBackend::Draw(const DrawPacket& p) {
   return true;
 }
 
-bool VulkanBackend::BeginQuery(uint32_t, uint32_t) {
-  NotYet("BeginQuery");
-  return false;
+bool VulkanBackend::BeginQuery(uint32_t slot, uint32_t index) {
+  if (!query_pools_[slot] || !query_readback_[slot] || index >= kMaxQueries) return false;
+  device_->functions().vkCmdBeginQuery(cb_, query_pools_[slot], index,
+                                       device_->properties().occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+  return true;
 }
-void VulkanBackend::EndQuery(uint32_t, uint32_t) { NotYet("EndQuery"); }
-void VulkanBackend::ResetQueries(uint32_t, uint32_t) { NotYet("ResetQueries"); }
-void VulkanBackend::ResolveQueries(uint32_t, uint32_t) { NotYet("ResolveQueries"); }
-const uint64_t* VulkanBackend::QueryResults(uint32_t) {
-  NotYet("QueryResults");
-  return nullptr;
+
+void VulkanBackend::EndQuery(uint32_t slot, uint32_t index) {
+  device_->functions().vkCmdEndQuery(cb_, query_pools_[slot], index);
 }
-bool VulkanBackend::Present(uint32_t, GpuImage*, uint32_t, uint32_t, uint32_t, uint32_t, bool) {
-  NotYet("Present");
-  return false;
+
+void VulkanBackend::ResetQueries(uint32_t slot, uint32_t count) {
+  if (query_pools_[slot]) device_->functions().vkCmdResetQueryPool(cb_, query_pools_[slot], 0, count);
+}
+
+void VulkanBackend::ResolveQueries(uint32_t slot, uint32_t count) {
+  if (!query_pools_[slot] || !query_readback_[slot] || !count) return;
+  device_->functions().vkCmdCopyQueryPoolResults(cb_, query_pools_[slot], 0, count, query_readback_[slot]->buffer, 0,
+                                                 sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+}
+
+const uint64_t* VulkanBackend::QueryResults(uint32_t slot) {
+  return query_readback_[slot] ? reinterpret_cast<const uint64_t*>(query_readback_[slot]->mapping) : nullptr;
+}
+
+bool VulkanBackend::Present(uint32_t slot, GpuImage* front, uint32_t front_width, uint32_t front_height,
+                            uint32_t width, uint32_t height, bool is_8bpc) {
+  if (!presenter_ || !front) return false;
+  bool submitted = false;
+  presenter_->RefreshGuestOutput(
+      width, height, width, height, [&](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+        auto& vulkan_context = static_cast<ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext&>(context);
+        const ui::vulkan::VulkanDevice::Functions& dfn = device_->functions();
+        VkDescriptorSet set = present_sets_[slot];
+        VkDescriptorImageInfo source_info = {VK_NULL_HANDLE, front->view, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorImageInfo sampler_info = {linear_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+        VkDescriptorImageInfo output_info = {VK_NULL_HANDLE, vulkan_context.image_view(), VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet writes[3] = {};
+        for (int i = 0; i < 3; ++i) {
+          writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+          writes[i].dstSet = set;
+          writes[i].dstBinding = uint32_t(i);
+          writes[i].descriptorCount = 1;
+        }
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[0].pImageInfo = &source_info;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes[1].pImageInfo = &sampler_info;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[2].pImageInfo = &output_info;
+        dfn.vkUpdateDescriptorSets(device_->device(), 3, writes, 0, nullptr);
+
+        VkImageMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = vulkan_context.image();
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        dfn.vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
+                                 nullptr, 0, nullptr, 1, &barrier);
+        dfn.vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, present_pipeline_);
+        dfn.vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, present_pipeline_layout_, 0, 1, &set, 0,
+                                    nullptr);
+        struct {
+          float scale[2];
+          uint32_t size[2];
+        } pc = {{float(width) / float(front_width), float(height) / float(front_height)}, {width, height}};
+        dfn.vkCmdPushConstants(cb_, present_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        dfn.vkCmdDispatch(cb_, (width + 7) / 8, (height + 7) / 8, 1);
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.newLayout = ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout;
+        dfn.vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask, 0, 0, nullptr, 0, nullptr,
+                                 1, &barrier);
+        context.SetIs8bpc(is_8bpc);
+        submitted = true;
+        return SubmitFrame(slot);
+      });
+  return submitted;
+}
+
+std::unique_ptr<GpuBackend> CreateVulkanBackend(GraphicsSystem* graphics_system) {
+  auto* provider = static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider());
+  return std::make_unique<VulkanBackend>(provider->vulkan_device(), graphics_system->presenter());
 }
 
 }  // namespace rex::graphics::sdnx

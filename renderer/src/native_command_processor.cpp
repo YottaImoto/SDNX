@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Sleeping Dogs port (SDNX): native renderer command processor (stage 2b).
  *
  * The base CommandProcessor parses the PM4 ring. Here:
@@ -12,8 +12,15 @@
  * All work of a frame goes into one command buffer, submitted at the swap.
  */
 #include <rex/graphics/sdnx/native_command_processor.h>
+#include <rex/graphics/sdnx/native_graphics_system.h>  // REXCVAR_DECLARE(sdnx_deko3d_backend)
+
+#if REX_PLATFORM_SWITCH
+#include "deko3d_backend.h"
+#endif
 
 #include <algorithm>
+#include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -29,13 +36,7 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/string/buffer.h>
-#include <rex/ui/vulkan/device.h>
-#include <rex/ui/vulkan/presenter.h>
-#include <rex/ui/vulkan/provider.h>
-#include <rex/ui/vulkan/util.h>
 
-#include "shaders/present_cs.h"
-#include "vulkan_backend.h"
 
 namespace rex::graphics::sdnx {
 
@@ -114,6 +115,7 @@ VkClearColorValue DecodeColorClear(xenos::ColorRenderTargetFormat format, uint32
 void NativeCommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   if (index >= 0x2000 && index < RegisterFile::kRegisterCount) {
     register_file_->values[index] = value;
+    if (index >= 0x4000 && index < 0x4800) NoteConstantWrites(index, 1);  // §16.135
     return;
   }
   CommandProcessor::WriteRegister(index, value);
@@ -123,6 +125,7 @@ void NativeCommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_
   if (start_index >= 0x2000 && start_index + num_registers <= RegisterFile::kRegisterCount) {
     uint32_t* dst = &register_file_->values[start_index];
     for (uint32_t i = 0; i < num_registers; ++i) dst[i] = __builtin_bswap32(base[i]);
+    NoteConstantWrites(start_index, num_registers);  // §16.135
     return;
   }
   CommandProcessor::WriteRegistersFromMem(start_index, base, num_registers);
@@ -133,10 +136,6 @@ NativeCommandProcessor::NativeCommandProcessor(GraphicsSystem* graphics_system,
     : CommandProcessor(graphics_system, kernel_state) {}
 
 NativeCommandProcessor::~NativeCommandProcessor() = default;
-
-const ui::vulkan::VulkanDevice* NativeCommandProcessor::vulkan_device() const {
-  return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())->vulkan_device();
-}
 
 uint64_t NativeCommandProcessor::RenderTargetKey(uint32_t base_tiles, uint32_t pitch_pixels, uint32_t format,
                                                  xenos::MsaaSamples msaa, bool is_depth) {
@@ -163,17 +162,19 @@ bool NativeCommandProcessor::CreateImage(Image& image, VkFormat format, uint32_t
   desc.height = height;
   desc.render_target = !depth;
   desc.depth_stencil = depth;
+  // §16.123: every image made here is EDRAM-derived (targets, resolves, their copies). §16.124: except the output-sized
+  // ones (1280 wide: the front buffer the UI is drawn into and its resolves) - the game composites its 1200x704 scene
+  // into them with its own final pass, which then upscales the scaled scene while the UI stays at full resolution.
+  desc.scaled = width < 1280;
   image.gpu = backend_->CreateImage(desc);
+  image.desc = desc;
   if (!image.gpu) {
     REXGPU_ERROR("[sdnx_native] could not create a {}x{} image (format {})", width, height, int(format));
     return false;
   }
-  image.image = image.gpu->image;
-  image.view = image.gpu->view;
   image.format = format;
   image.width = width;
   image.height = height;
-  image.aspect = image.gpu->aspect;
   image.initialized = false;
   if (trace_image) {
     REXGPU_INFO("[sdnx_trace]   image ready");
@@ -182,61 +183,25 @@ bool NativeCommandProcessor::CreateImage(Image& image, VkFormat format, uint32_t
 }
 
 void NativeCommandProcessor::DestroyImage(Image& image) {
-  if (image.gpu) {
-    backend_->DestroyImage(image.gpu);
-    image = Image();
-    return;
-  }
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  if (image.view) dfn.vkDestroyImageView(device->device(), image.view, nullptr);
-  if (image.image) dfn.vkDestroyImage(device->device(), image.image, nullptr);
-  if (image.memory) dfn.vkFreeMemory(device->device(), image.memory, nullptr);
+  if (image.gpu) backend_->DestroyImage(image.gpu);
   image = Image();
 }
 
 void NativeCommandProcessor::InitializeLayout(Image& image) {
   if (image.initialized) return;
-  if (image.gpu) {
-    backend_->InitializeImage(image.gpu, image.gpu->desc, true);
-    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
-    FullBarrier();
-    image.initialized = true;
-    return;
-  }
-  VkImageMemoryBarrier barrier = {};
-  barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-  barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  barrier.image = image.image;
-  barrier.subresourceRange = {image.aspect, 0, 1, 0, 1};
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device()->functions();
-  dfn.vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
-                           0, nullptr, 1, &barrier);
-  // New memory has undefined contents: start colour at 0 and depth at 1 (far), as after a clear.
-  VkImageSubresourceRange range = {image.aspect, 0, 1, 0, 1};
-  if (image.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
-    VkClearDepthStencilValue ds = {1.0f, 0};
-    dfn.vkCmdClearDepthStencilImage(cb_, image.image, VK_IMAGE_LAYOUT_GENERAL, &ds, 1, &range);
-    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
-  } else {
-    VkClearColorValue color = {};
-    dfn.vkCmdClearColorImage(cb_, image.image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
-    transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
-  }
+  if (!image.gpu) return;
+  backend_->InitializeImage(image.gpu, image.desc, true);
+  transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   FullBarrier();
   image.initialized = true;
 }
 
 void NativeCommandProcessor::RetireImage(Image& image) {
-  if (image.image) {
+  if (image.gpu) {
     // Into the slot of the frame being recorded: open it first, otherwise the image would land in the slot
     // EnsureFrame empties right away while the previous frame may still be using it.
     EnsureFrame();
-    RetireViews(image.image);
+    RetireViews(image.gpu);
     retired_images_[uint32_t(frame_ % kFramesInFlight)].push_back(image);
   }
   image = Image();
@@ -269,12 +234,12 @@ void NativeCommandProcessor::AttachmentBarrier() {
 // The barrier a new rendering pass needs: full after a transfer, attachment-only when it uses an attachment an
 // earlier pass wrote since the last barrier, none otherwise (338 full barriers per frame before, 2026-11-13).
 // SDNX_FULL_BARRIERS=1 restores a full barrier before every pass (A/B).
-void NativeCommandProcessor::BeginPassBarrier(const VkImage* images, uint32_t count) {
+void NativeCommandProcessor::BeginPassBarrier(GpuImage* const* images, uint32_t count) {
   static const bool always_full = std::getenv("SDNX_FULL_BARRIERS") != nullptr;
   bool overlap = false;
   for (uint32_t i = 0; i < count && !overlap; ++i) {
     if (!images[i]) continue;
-    for (VkImage written : attachments_written_) {
+    for (const GpuImage* written : attachments_written_) {
       if (written == images[i]) {
         overlap = true;
         break;
@@ -301,15 +266,25 @@ NativeCommandProcessor::Image* NativeCommandProcessor::GetRenderTarget(uint32_t 
   // the pixel pitch and MSAA, those clears went to an image of their own and the UI stencil was never cleared.
   uint32_t sx = uint32_t(msaa >= xenos::MsaaSamples::k4X), sy = uint32_t(msaa >= xenos::MsaaSamples::k2X);
   pitch_pixels = std::max(pitch_pixels << sx, uint32_t(8));
-  min_height = std::max(min_height << sy, uint32_t(8));
+  // The cache and allocation must use the same sample-space height. A full-height
+  // scissor with MSAA can request 4096 rows even when the existing 2048-row image fits.
+  constexpr uint32_t kMaxHeightSamples = 2048;
+  const uint32_t requested_height = min_height;
+  min_height = std::max(8u, std::min(min_height, kMaxHeightSamples >> sy) << sy);
   uint64_t key = RenderTargetKey(base_tiles, pitch_pixels, format, xenos::MsaaSamples::k1X, is_depth);
   Image& image = render_targets_[key];
-  if (image.image && image.height >= min_height) {
+  if (image.gpu && image.height >= min_height) {
     return &image;
   }
-  uint32_t height = std::max(min_height, image.height);
-  height = (height + 15) & ~15u;
-  if (image.image) {
+  const uint32_t height = (min_height + 15) & ~15u;
+  static uint32_t rt_count = 0;
+  if (rt_count < 200) {
+    REXGPU_INFO("[sdnx_rt] #{} base={:#x} pitch={} format={} depth={} msaa={} requested_rows={} "
+                "sample_rows={} -> {}",
+                rt_count++, base_tiles, pitch_pixels, format, is_depth, uint32_t(msaa), requested_height,
+                image.height, height);
+  }
+  if (image.gpu) {
     // Grow: the old contents are dropped (rare; the next stage keeps them). The image may still be used by
     // commands recorded in this frame, so it is destroyed later.
     RetireImage(image);
@@ -339,10 +314,10 @@ NativeCommandProcessor::Image* NativeCommandProcessor::GetResolved(uint32_t addr
   width = std::max(width, uint32_t(8));
   height = std::max(height, uint32_t(8));
   Image& image = resolved_[address];
-  if (image.image && image.format == format && image.width >= width && image.height >= height) {
+  if (image.gpu && image.format == format && image.width >= width && image.height >= height) {
     return &image;
   }
-  if (image.image) RetireImage(image);
+  if (image.gpu) RetireImage(image);
   EnsureFrame();
   EndRendering();
   if (!CreateImage(image, format, width, height, false)) {
@@ -353,67 +328,23 @@ NativeCommandProcessor::Image* NativeCommandProcessor::GetResolved(uint32_t addr
   return &image;
 }
 
-bool NativeCommandProcessor::CreatePresentPipeline() {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  VkDescriptorSetLayoutBinding bindings[3] = {};
-  bindings[0] = {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-  bindings[1] = {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-  bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-  VkDescriptorSetLayoutCreateInfo set_info = {};
-  set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-  set_info.bindingCount = 3;
-  set_info.pBindings = bindings;
-  if (dfn.vkCreateDescriptorSetLayout(device->device(), &set_info, nullptr, &present_set_layout_) != VK_SUCCESS)
-    return false;
-  VkPushConstantRange push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
-  VkPipelineLayoutCreateInfo layout_info = {};
-  layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-  layout_info.setLayoutCount = 1;
-  layout_info.pSetLayouts = &present_set_layout_;
-  layout_info.pushConstantRangeCount = 1;
-  layout_info.pPushConstantRanges = &push;
-  if (dfn.vkCreatePipelineLayout(device->device(), &layout_info, nullptr, &present_pipeline_layout_) != VK_SUCCESS)
-    return false;
-  present_pipeline_ = ui::vulkan::util::CreateComputePipeline(device, present_pipeline_layout_, shaders::kPresentCs,
-                                                              sizeof(shaders::kPresentCs));
-  if (present_pipeline_ == VK_NULL_HANDLE) return false;
-  VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kFramesInFlight},
-                                   {VK_DESCRIPTOR_TYPE_SAMPLER, kFramesInFlight},
-                                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kFramesInFlight}};
-  VkDescriptorPoolCreateInfo pool_info = {};
-  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-  pool_info.maxSets = kFramesInFlight;
-  pool_info.poolSizeCount = 3;
-  pool_info.pPoolSizes = sizes;
-  if (dfn.vkCreateDescriptorPool(device->device(), &pool_info, nullptr, &present_descriptor_pool_) != VK_SUCCESS)
-    return false;
-  std::array<VkDescriptorSetLayout, kFramesInFlight> layouts;
-  layouts.fill(present_set_layout_);
-  VkDescriptorSetAllocateInfo alloc = {};
-  alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-  alloc.descriptorPool = present_descriptor_pool_;
-  alloc.descriptorSetCount = kFramesInFlight;
-  alloc.pSetLayouts = layouts.data();
-  if (dfn.vkAllocateDescriptorSets(device->device(), &alloc, present_sets_.data()) != VK_SUCCESS) return false;
-  VkSamplerCreateInfo sampler = {};
-  sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-  sampler.magFilter = VK_FILTER_LINEAR;
-  sampler.minFilter = VK_FILTER_LINEAR;
-  sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  sampler.maxLod = 0.0f;
-  return dfn.vkCreateSampler(device->device(), &sampler, nullptr, &linear_sampler_) == VK_SUCCESS;
-}
-
 bool NativeCommandProcessor::SetupContext() {
   static_assert(kFramesInFlight == GpuBackend::kFramesInFlight);
-  backend_ = std::make_unique<VulkanBackend>(vulkan_device());
+#if REX_PLATFORM_SWITCH
+  // deko3d is opt-in until its presenter is in (docs/deko3d-backend.md); until then the console runs the Vulkan
+  // (NVK) path. SDNX_DEKO3D=1 or the cvar turns it on.
+  static const bool use_deko3d = [] {
+    const char* env = std::getenv("SDNX_DEKO3D");
+    return (env && *env && *env != '0') || REXCVAR_GET(sdnx_deko3d_backend);
+  }();
+  backend_ = use_deko3d ? CreateDeko3dBackend() : CreateVulkanBackend(graphics_system_);
+  REXGPU_INFO("[sdnx_native] backend: {} (SDNX_DEKO3D={})", use_deko3d ? "deko3d" : "Vulkan",
+              std::getenv("SDNX_DEKO3D") ? std::getenv("SDNX_DEKO3D") : "-");
+#else
+  backend_ = CreateVulkanBackend(graphics_system_);
+#endif
   if (!backend_->Initialize()) {
     REXGPU_ERROR("[sdnx_native] could not start the {} backend", backend_->name());
-    return false;
-  }
-  if (!CreatePresentPipeline()) {
-    REXGPU_ERROR("[sdnx_native] could not create the output pipeline");
     return false;
   }
   if (!InitializeDraws()) {
@@ -426,9 +357,7 @@ bool NativeCommandProcessor::SetupContext() {
 }
 
 void NativeCommandProcessor::ShutdownContext() {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  dfn.vkDeviceWaitIdle(device->device());
+  backend_->WaitIdle();
   ShutdownQueries();
   ShutdownGeometry();
   ShutdownDraws();
@@ -443,11 +372,13 @@ void NativeCommandProcessor::ShutdownContext() {
   resolved_stencil_.clear();
   for (auto& it : resolved_) DestroyImage(it.second);
   resolved_.clear();
-  if (linear_sampler_) dfn.vkDestroySampler(device->device(), linear_sampler_, nullptr);
-  if (present_descriptor_pool_) dfn.vkDestroyDescriptorPool(device->device(), present_descriptor_pool_, nullptr);
-  if (present_pipeline_) dfn.vkDestroyPipeline(device->device(), present_pipeline_, nullptr);
-  if (present_pipeline_layout_) dfn.vkDestroyPipelineLayout(device->device(), present_pipeline_layout_, nullptr);
-  if (present_set_layout_) dfn.vkDestroyDescriptorSetLayout(device->device(), present_set_layout_, nullptr);
+  for (LumaSlot& slot : luma_slots_) {
+    backend_->DestroyBuffer(slot.buffer);
+    slot = LumaSlot();
+  }
+  backend_->DestroyBuffer(dump_buffer_);
+  dump_buffer_ = nullptr;
+  dump_mapping_ = nullptr;
   backend_->Shutdown();
   backend_.reset();
   shaders_.clear();
@@ -458,7 +389,6 @@ void NativeCommandProcessor::EnsureFrame() {
   uint32_t slot = uint32_t(frame_ % kFramesInFlight);
   backend_->BeginFrame(slot);  // waits for the slot's fence
   LumaCheck(slot);  // the slot's previous frame has completed: its presented image is in the readback buffer
-  cb_ = backend_->command_buffer();
   transfer_pending_ = true;  // first pass of a command buffer: full barrier (earlier submissions)
   upload_[slot].offset = 0;
   frame_open_ = true;
@@ -473,8 +403,14 @@ void NativeCommandProcessor::EnsureFrame() {
     // The placeholder textures: GENERAL layout (as their descriptors say) and white. They were left in
     // UNDEFINED, so the shaders sampled undefined data (zero on NVIDIA): textured UI came out black.
     dummies_initialized_ = true;
-    for (Image* dummy : {&dummy_2d_, &dummy_3d_, &dummy_cube_}) {
-      backend_->InitializeImage(dummy->gpu, dummy->gpu->desc, false);
+    SamplerDesc sampler;
+    sampler.mag_linear = sampler.min_linear = true;
+    backend_->WriteSamplerDescriptor(0, sampler);
+    Image* dummies[] = {&dummy_2d_, &dummy_3d_, &dummy_cube_};
+    for (uint32_t i = 0; i < 3; ++i) {
+      Image* dummy = dummies[i];
+      backend_->WriteImageDescriptor(dummy->desc.type, 0, dummy_views_[i]);
+      backend_->InitializeImage(dummy->gpu, dummy->desc, false);
       ImageRegion all;
       all.layer_count = dummy == &dummy_cube_ ? 6 : 1;
       const float white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -486,13 +422,32 @@ void NativeCommandProcessor::EnsureFrame() {
   }
 }
 
-bool NativeCommandProcessor::SubmitFrame() {
+bool NativeCommandProcessor::SubmitFrame(const Image* front, uint32_t width, uint32_t height) {
   if (!frame_open_) return true;
   EndRendering();
-  CopyQueryResults(uint32_t(frame_ % kFramesInFlight));
-  const bool result = backend_->SubmitFrame(uint32_t(frame_ % kFramesInFlight));
+  const uint32_t slot = uint32_t(frame_ % kFramesInFlight);
+  CopyQueryResults(slot);
+  bool result = true;
+  bool presented = false;
+  if (front && front->gpu) {
+    FullBarrier();  // everything drawn before the copy of the front image
+    presented = backend_->Present(slot, front->gpu, front->width, front->height, width, height,
+                                  front->format == VK_FORMAT_R8G8B8A8_UNORM);
+  }
+  if (presented) {
+    static bool first = true;
+    if (first) {
+      first = false;
+      REXGPU_INFO("[sdnx_native] output: frames are presented through the {} backend", backend_->name());
+    }
+  } else {
+    if (front && front->gpu) {
+      static uint32_t not_presented = 0;
+      if (not_presented++ < 4) REXGPU_WARN("[sdnx_native] output: the presenter took no frame (swap {})", swap_count_);
+    }
+    result = backend_->SubmitFrame(slot);
+  }
   frame_open_ = false;
-  cb_ = VK_NULL_HANDLE;
   ++frame_;
   return result;
 }
@@ -564,18 +519,35 @@ Shader* NativeCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
   return result;
 }
 
+namespace {
+uint64_t SdnxNowNs() { return SdnxTicksToNs(SdnxTicks()); }  // §16.141
+}  // namespace
+
+void NativeCommandProcessor::PrepareForWait() { cpu_wait_start_ns_ = SdnxNowNs(); }
+
+void NativeCommandProcessor::ReturnFromWait() {
+  if (cpu_wait_start_ns_) cpu_idle_ns_ += SdnxNowNs() - cpu_wait_start_ns_;
+  cpu_wait_start_ns_ = 0;
+}
+
 bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info, bool major_mode_explicit) {
   (void)prim_type;
   (void)index_buffer_info;
   (void)major_mode_explicit;
+  const uint64_t start = SdnxNowNs();
   // A resolve arrives as a draw in the EDRAM copy mode (as in the Vulkan backend).
   if (register_file_->Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kCopy) {
-    return IssueCopy();
+    const bool ok = IssueCopy();
+    cpu_copy_ns_ += SdnxNowNs() - start;
+    return ok;
   }
   ++stats_.draws;
+  ++cpu_window_draws_;
   stats_.indices += index_count;
-  return DrawNative(prim_type, index_count, index_buffer_info);
+  const bool ok = DrawNative(prim_type, index_count, index_buffer_info);
+  cpu_draw_ns_ += SdnxNowNs() - start;
+  return ok;
 }
 
 bool NativeCommandProcessor::IssueCopy() {
@@ -594,7 +566,6 @@ bool NativeCommandProcessor::IssueCopy() {
   }
   EnsureFrame();
   EndRendering();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device()->functions();
   const RegisterFile& regs = *register_file_;
   auto surface = regs.Get<reg::RB_SURFACE_INFO>();
   uint32_t pitch = surface.surface_pitch;
@@ -612,6 +583,21 @@ bool NativeCommandProcessor::IssueCopy() {
   uint32_t y0 = ((offset_tiles / pitch_tiles) * xenos::kEdramTileHeightSamples +
                  (info.coordinate_info.edram_offset_y_div_8 << (sy + 3))) >> sy;
   uint32_t width = info.coordinate_info.width_div_8 * 8, height = info.height_div_8 * 8;
+  // The EDRAM-to-pixel math can produce a rectangle far outside the surface (a 1280x4096 target for a 720p frame
+  // grew the render target and the front-buffer blit every frame, and the GPU faulted after ~35 of them).
+  {
+    static uint32_t res_count = 0;
+    if (res_count < 20 || (x0 + width > 2048 || y0 + height > 2048)) {
+      REXGPU_INFO("[sdnx_res] #{} base={:#x} x={} y={} w={} h={} pitch={} msaa={} depth={}", res_count,
+                  original_base, x0, y0, width, height, pitch, uint32_t(msaa), copy_depth);
+    }
+    ++res_count;
+  }
+  if (x0 + width > 4096 || y0 + height > 2048) {
+    // Do not make an oversized target or blit from it: the guest resolves what fits its surface.
+    ++stats_.copies_incompatible;
+    return true;
+  }
 
   uint32_t format =
       copy_depth ? uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_format) : uint32_t(edram.format);
@@ -702,6 +688,7 @@ bool NativeCommandProcessor::IssueCopy() {
             to.height = copy_h;
             backend_->BlitImage(source->gpu, from, dest->gpu, to, Aspect::kColor, sx || sy);
             transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
+            if (log_frame_) backend_->DebugProbe(dest->gpu, to, dest_base, "resolve");  // §16.108
           }
         }
         DumpResolveIfRequested(dest_base, *dest);
@@ -725,7 +712,7 @@ bool NativeCommandProcessor::IssueCopy() {
       uint64_t base_pitch = uint64_t(info.color_original_base & 0xFFF) | (uint64_t((pitch << sx) & 0xFFFF) << 12);
       for (auto& it : render_targets_) {
         bool is_depth = (it.first >> 38) & 1;
-        if (is_depth || (it.first & 0xFFFFFFF) != base_pitch || !it.second.image) continue;
+        if (is_depth || (it.first & 0xFFFFFFF) != base_pitch || !it.second.gpu) continue;
         backend_->ClearColor(it.second.gpu, ImageRegion(), color.float32);
         transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
         ++stats_.clears;
@@ -794,11 +781,11 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
     transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     // Stencil, for TryRestoreDepth.
     Image& stencil = resolved_stencil_[dest_base];
-    if (stencil.image && (stencil.width < dest->width || stencil.height < dest->height)) RetireImage(stencil);
-    if (!stencil.image && CreateImage(stencil, VK_FORMAT_R8_UNORM, dest->width, dest->height, false)) {
+    if (stencil.gpu && (stencil.width < dest->width || stencil.height < dest->height)) RetireImage(stencil);
+    if (!stencil.gpu && CreateImage(stencil, VK_FORMAT_R8_UNORM, dest->width, dest->height, false)) {
       InitializeLayout(stencil);
     }
-    VkDeviceSize stencil_offset = stencil.image ? Upload(nullptr, VkDeviceSize(src_w) * src_h, 16) : UINT64_MAX;
+    VkDeviceSize stencil_offset = stencil.gpu ? Upload(nullptr, VkDeviceSize(src_w) * src_h, 16) : UINT64_MAX;
     if (stencil_offset != UINT64_MAX) {
       FullBarrier();
       ImageRegion s_region;
@@ -815,9 +802,9 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
       transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     }
   } else {
-    if (!depth_resolve_temp_.image || depth_resolve_temp_.width < src_w || depth_resolve_temp_.height < src_h) {
+    if (!depth_resolve_temp_.gpu || depth_resolve_temp_.width < src_w || depth_resolve_temp_.height < src_h) {
       uint32_t tw = std::max(src_w, depth_resolve_temp_.width), th = std::max(src_h, depth_resolve_temp_.height);
-      if (depth_resolve_temp_.image) RetireImage(depth_resolve_temp_);
+      if (depth_resolve_temp_.gpu) RetireImage(depth_resolve_temp_);
       if (!CreateImage(depth_resolve_temp_, VK_FORMAT_R32_SFLOAT, tw, th, false)) return;
       InitializeLayout(depth_resolve_temp_);
     }
@@ -835,6 +822,14 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
     transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   }
   FullBarrier();
+  if (log_frame_) {  // §16.108: what the depth resolve put into its R32F image (shadow maps: 0.79..1.0 on the stand)
+    ImageRegion probed;
+    probed.x = int32_t(dx);
+    probed.y = int32_t(dy);
+    probed.width = out_w;
+    probed.height = out_h;
+    backend_->DebugProbe(dest->gpu, probed, dest_base, "depth");
+  }
 }
 
 bool NativeCommandProcessor::TryRestoreDepth(Shader* ps) {
@@ -869,14 +864,28 @@ bool NativeCommandProcessor::TryRestoreDepth(Shader* ps) {
   GpuBuffer* buffer = upload_[uint32_t(frame_ % kFramesInFlight)].gpu;
   uint32_t pitch_pixels = fetch.pitch ? uint32_t(fetch.pitch) << 5 : ((tw + 31) & ~31u);
   uint64_t row_bytes = uint64_t(pitch_pixels) * 4;
+  // §16.114: the parts in address order, each cut at the row where the next part begins. With predicated tiling the
+  // top tile's image (0x10233000) is as tall as the whole texture (the end-of-frame 1200x704 resolve goes there too),
+  // so its lower rows held the previous frame's depth; restored after the bottom tile (0x103d5000, row 352) in
+  // unordered_map order, they overwrote it - the lower half of the screen lost its depth and went black.
+  std::vector<const std::pair<const uint32_t, Image>*> parts;
   for (const auto& part : resolved_) {
-    if (!part.second.image || part.second.format != VK_FORMAT_R32_SFLOAT) continue;
+    if (!part.second.gpu || part.second.format != VK_FORMAT_R32_SFLOAT) continue;
     if (part.first < base || part.first >= base + row_bytes * th) continue;
+    parts.push_back(&part);
+  }
+  std::sort(parts.begin(), parts.end(), [](auto* a, auto* b) { return a->first < b->first; });
+  for (size_t index = 0; index < parts.size(); ++index) {
+    const auto& part = *parts[index];
     uint64_t delta = part.first - base;
     uint32_t y = uint32_t(delta / row_bytes), x = uint32_t((delta % row_bytes) / 4);
     if (x >= tw || y >= th || x >= target->width || y >= target->height) continue;
     uint32_t w = std::min({tw - x, part.second.width, target->width - x});
     uint32_t h = std::min({th - y, part.second.height, target->height - y});
+    if (index + 1 < parts.size()) {
+      const uint32_t next_y = uint32_t((parts[index + 1]->first - base) / row_bytes);
+      if (next_y > y) h = std::min(h, next_y - y);
+    }
     VkDeviceSize offset = Upload(nullptr, VkDeviceSize(w) * h * 4, 16);
     if (offset == UINT64_MAX) continue;
     FullBarrier();
@@ -892,7 +901,7 @@ bool NativeCommandProcessor::TryRestoreDepth(Shader* ps) {
     backend_->CopyBufferToImage({buffer, offset}, 0, 0, target->gpu, at, Aspect::kDepth);
     transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
     auto stencil = resolved_stencil_.find(part.first);
-    if (stencil == resolved_stencil_.end() || !stencil->second.image) continue;
+    if (stencil == resolved_stencil_.end() || !stencil->second.gpu) continue;
     w = std::min(w, stencil->second.width);
     h = std::min(h, stencil->second.height);
     offset = Upload(nullptr, VkDeviceSize(w) * h, 16);
@@ -911,7 +920,7 @@ bool NativeCommandProcessor::TryRestoreDepth(Shader* ps) {
   FullBarrier();
   if (log_frame_) {
     REXGPU_INFO("[sdnx_frame] depth restore from {:#x} ({}x{}) to depth base {} pitch {} (image {:#x})", base, tw,
-                th, uint32_t(color_info.color_base), pitch, uint64_t(reinterpret_cast<uintptr_t>(target->image)));
+                th, uint32_t(color_info.color_base), pitch, uint64_t(reinterpret_cast<uintptr_t>(target->gpu)));
   }
   return true;
 }
@@ -941,9 +950,8 @@ void NativeCommandProcessor::ReportStats() {
       stats_.tex_bytes / frames / 1048576.0);
   write_callbacks_reported_ = write_callbacks_.load();
   if (stats_.prof_draws) {
-    // steady_clock ticks -> microseconds per drawn draw and per frame.
-    using period = std::chrono::steady_clock::period;
-    const double to_us = 1e6 * double(period::num) / double(period::den);
+    // SdnxTicks -> microseconds per drawn draw and per frame (§16.141).
+    const double to_us = double(SdnxTicksToNs(1000000000ull)) / 1e12;
     const double d = double(stats_.prof_draws);
     double total = 0;
     for (uint64_t ns : stats_.prof_ns) total += double(ns);
@@ -990,28 +998,21 @@ void NativeCommandProcessor::ReportStats() {
 void NativeCommandProcessor::LumaRecord(const Image& front) {
   static const bool enabled = std::getenv("SDNX_LUMA_LOG") != nullptr;
   if (!enabled || front.format != VK_FORMAT_R8G8B8A8_UNORM) return;
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
   uint32_t slot = uint32_t(frame_ % kFramesInFlight);
   LumaSlot& s = luma_slots_[slot];
   VkDeviceSize size = VkDeviceSize(front.width) * front.height * 4;
   if (!s.buffer || s.size < size) {
     if (s.buffer) return;  // size changed: skip (rare)
-    uint32_t memory_type = 0;
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                                           ui::vulkan::util::MemoryPurpose::kReadback, s.buffer,
-                                                           s.memory, &memory_type)) {
-      return;
-    }
-    dfn.vkMapMemory(device->device(), s.memory, 0, VK_WHOLE_SIZE, 0, &s.mapping);
+    s.buffer = backend_->CreateBuffer(size, BufferUsage::kReadback, &s.mapping);
+    if (!s.buffer) return;
     s.size = size;
   }
   EndRendering();
   FullBarrier();
-  VkBufferImageCopy region = {};
-  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.imageExtent = {front.width, front.height, 1};
-  dfn.vkCmdCopyImageToBuffer(cb_, front.image, VK_IMAGE_LAYOUT_GENERAL, s.buffer, 1, &region);
+  ImageRegion region;
+  region.width = front.width;
+  region.height = front.height;
+  backend_->CopyImageToBuffer(front.gpu, region, Aspect::kColor, {s.buffer, 0}, 0);
   transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   s.pending = true;
   s.width = front.width;
@@ -1023,7 +1024,7 @@ void NativeCommandProcessor::LumaCheck(uint32_t slot) {
   LumaSlot& s = luma_slots_[slot];
   if (!s.pending || !s.mapping) return;
   s.pending = false;
-  const uint8_t* p = static_cast<const uint8_t*>(s.mapping);
+  const uint8_t* p = s.mapping;
   uint64_t sum = 0, count = 0;
   for (uint32_t y = 0; y < s.height; y += 8) {
     const uint8_t* row = p + size_t(y) * s.width * 4;
@@ -1044,30 +1045,23 @@ void NativeCommandProcessor::LumaCheck(uint32_t slot) {
 }
 
 void NativeCommandProcessor::BeginFrontDump(const Image& front) {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
   uint32_t bpp = (front.format == VK_FORMAT_R16G16B16A16_UNORM || front.format == VK_FORMAT_R16G16B16A16_SFLOAT)
                      ? 8u
                      : 4u;
   VkDeviceSize size = VkDeviceSize(front.width) * front.height * bpp;
   if (!dump_buffer_ || dump_size_ < size) {
     if (dump_buffer_) {
-      dfn.vkUnmapMemory(device->device(), dump_memory_);
-      dfn.vkDestroyBuffer(device->device(), dump_buffer_, nullptr);
-      dfn.vkFreeMemory(device->device(), dump_memory_, nullptr);
-      dump_buffer_ = VK_NULL_HANDLE;
-      dump_memory_ = VK_NULL_HANDLE;
+      backend_->WaitIdle();  // the last dump's copy may still be pending
+      backend_->DestroyBuffer(dump_buffer_);
+      dump_buffer_ = nullptr;
       dump_mapping_ = nullptr;
     }
-    uint32_t memory_type = 0;
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, ui::vulkan::util::MemoryPurpose::kReadback, dump_buffer_,
-            dump_memory_, &memory_type)) {
+    dump_buffer_ = backend_->CreateBuffer(size, BufferUsage::kReadback, &dump_mapping_);
+    if (!dump_buffer_) {
       REXGPU_ERROR("[sdnx_front] could not create the readback buffer");
       dump_remaining_ = 0;
       return;
     }
-    dfn.vkMapMemory(device->device(), dump_memory_, 0, VK_WHOLE_SIZE, 0, &dump_mapping_);
     dump_size_ = size;
   }
   dump_address_ = front_address_;
@@ -1076,10 +1070,10 @@ void NativeCommandProcessor::BeginFrontDump(const Image& front) {
   dump_bpp_ = bpp;
   dump_float_ = front.format == VK_FORMAT_R32_SFLOAT;
   FullBarrier();
-  VkBufferImageCopy region = {};
-  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-  region.imageExtent = {front.width, front.height, 1};
-  dfn.vkCmdCopyImageToBuffer(cb_, front.image, VK_IMAGE_LAYOUT_GENERAL, dump_buffer_, 1, &region);
+  ImageRegion region;
+  region.width = front.width;
+  region.height = front.height;
+  backend_->CopyImageToBuffer(front.gpu, region, Aspect::kColor, {dump_buffer_, 0}, 0);
   transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
   dump_pending_ = true;
 }
@@ -1098,10 +1092,8 @@ void NativeCommandProcessor::DumpResolveIfRequested(uint32_t dest_base, const Im
 void NativeCommandProcessor::FinishFrontDump() {
   if (!dump_pending_) return;
   dump_pending_ = false;
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  dfn.vkDeviceWaitIdle(device->device());
-  const uint8_t* data = static_cast<const uint8_t*>(dump_mapping_);
+  backend_->WaitIdle();
+  const uint8_t* data = dump_mapping_;
   if (!data) return;
   double sum[3] = {0, 0, 0};
   double maxv[3] = {0, 0, 0};
@@ -1189,6 +1181,29 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
   (void)frontbuffer_ptr;
   ++stats_.swaps;
   ++stats_total_swaps_;
+  // §16.132: this thread's time per frame: waiting for the game, translating draws and resolves, the rest (registers,
+  // packets, swap); GPU fence waits happen inside those.
+  {
+    const uint64_t now = SdnxNowNs();
+    if (!cpu_window_start_ns_) {
+      cpu_window_start_ns_ = now;
+      cpu_gpu_wait_base_ns_ = backend_->CpuWaitNs();
+      cpu_idle_ns_ = cpu_draw_ns_ = cpu_copy_ns_ = cpu_window_draws_ = 0;
+    } else if (stats_total_swaps_ % 30 == 0) {
+      const double frames = 30.0, ms = 1e6;
+      const uint64_t gpu_wait = backend_->CpuWaitNs() - cpu_gpu_wait_base_ns_;
+      const double wall = double(now - cpu_window_start_ns_) / frames / ms;
+      const double idle = double(cpu_idle_ns_) / frames / ms, draw = double(cpu_draw_ns_) / frames / ms;
+      const double copy = double(cpu_copy_ns_) / frames / ms, gw = double(gpu_wait) / frames / ms;
+      const double per_draw = cpu_window_draws_ ? double(cpu_draw_ns_) / 1e3 / double(cpu_window_draws_) : 0.0;
+      REXGPU_INFO("[sdnx_cpu] {:.1f} ms/frame: waiting for the game {:.1f}, draws {:.1f} ({} a frame, {:.1f} us each), "
+                  "resolves {:.1f}, other {:.1f}; GPU fence waits {:.1f} (inside the above)",
+                  wall, idle, draw, cpu_window_draws_ / 30, per_draw, copy, wall - idle - draw - copy, gw);
+      cpu_window_start_ns_ = now;
+      cpu_gpu_wait_base_ns_ = backend_->CpuWaitNs();
+      cpu_idle_ns_ = cpu_draw_ns_ = cpu_copy_ns_ = cpu_window_draws_ = 0;
+    }
+  }
 #if REX_PLATFORM_SWITCH
   RexSwitchPerfCount(0);
 #endif
@@ -1197,6 +1212,15 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     if (log_frame_) REXGPU_INFO("[sdnx_frame] ---- end of swap {} ----", swap_count_);
     ++swap_count_;
     log_frame_ = log_frame && swap_count_ == log_frame;
+    // §16.108: a second frame log (with the resolve probes) in case swap 900 was still a loading screen.
+    // §16.111: swap 1800 also dumps whole images of the shadow chain (Deko3dBackend::kDumpFrame).
+    // §16.117: only with sdnx_deko3d_frame_log (the logs, probes and the ~40 MB dump cost time and SD space).
+    static const bool deko3d_frame_log =
+        std::strcmp(backend_->name(), "deko3d") == 0 && REXCVAR_GET(sdnx_deko3d_frame_log);
+    if (deko3d_frame_log && (swap_count_ == 900 || swap_count_ == 1800)) {
+      log_frame_ = true;
+    }
+    stencil_probes_ = 0;
     // SDNX_LOG_AT / SDNX_DUMP_AT = seconds after the first swap: the frame log / one PPM of that moment (swap
     // numbers do not map to time - loading screens swap far faster than 60 per second).
     static const auto first_swap = std::chrono::steady_clock::now();
@@ -1247,7 +1271,7 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       std::getenv("SDNX_DUMP_ADDR") ? uint32_t(std::strtoul(std::getenv("SDNX_DUMP_ADDR"), nullptr, 16)) : 0;
   if (dump_addr) {
     auto it = resolved_.find(dump_addr);
-    if (it != resolved_.end() && it->second.image) {
+    if (it != resolved_.end() && it->second.gpu) {
       front = &it->second;
       front_address_ = dump_addr;
     }
@@ -1263,82 +1287,17 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     BeginFrontDump(*front);
   }
 
-  ui::Presenter* presenter = graphics_system_->presenter();
-  bool submitted = false;
   if (front) LumaRecord(*front);
-  if (presenter && front) {
-    uint32_t width = std::max(frontbuffer_width, uint32_t(1));
-    uint32_t height = std::max(frontbuffer_height, uint32_t(1));
-    presenter->RefreshGuestOutput(
-        width, height, width, height,
-        [this, front, width, height, &submitted](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
-          auto& vulkan_context =
-              static_cast<ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext&>(context);
-          const ui::vulkan::VulkanDevice* device = vulkan_device();
-          const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-          uint32_t slot = uint32_t(frame_ % kFramesInFlight);
-          VkDescriptorSet set = present_sets_[slot];
-          VkDescriptorImageInfo source_info = {VK_NULL_HANDLE, front->view, VK_IMAGE_LAYOUT_GENERAL};
-          VkDescriptorImageInfo sampler_info = {linear_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
-          VkDescriptorImageInfo output_info = {VK_NULL_HANDLE, vulkan_context.image_view(),
-                                               VK_IMAGE_LAYOUT_GENERAL};
-          VkWriteDescriptorSet writes[3] = {};
-          for (int i = 0; i < 3; ++i) {
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = set;
-            writes[i].dstBinding = uint32_t(i);
-            writes[i].descriptorCount = 1;
-          }
-          writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-          writes[0].pImageInfo = &source_info;
-          writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-          writes[1].pImageInfo = &sampler_info;
-          writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-          writes[2].pImageInfo = &output_info;
-          dfn.vkUpdateDescriptorSets(device->device(), 3, writes, 0, nullptr);
-
-          VkImageMemoryBarrier barrier = {};
-          barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-          barrier.srcAccessMask = ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask;
-          barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-          barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-          barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-          barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-          barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-          barrier.image = vulkan_context.image();
-          barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-          FullBarrier();
-          dfn.vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                                   0, nullptr, 0, nullptr, 1, &barrier);
-          dfn.vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, present_pipeline_);
-          dfn.vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, present_pipeline_layout_, 0, 1, &set, 0,
-                                      nullptr);
-          struct {
-            float scale[2];
-            uint32_t size[2];
-          } pc = {{float(width) / float(front->width), float(height) / float(front->height)}, {width, height}};
-          dfn.vkCmdPushConstants(cb_, present_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-          dfn.vkCmdDispatch(cb_, (width + 7) / 8, (height + 7) / 8, 1);
-          transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
-          barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-          barrier.dstAccessMask = ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask;
-          barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-          barrier.newLayout = ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout;
-          dfn.vkCmdPipelineBarrier(cb_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                   ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask, 0, 0, nullptr, 0,
-                                   nullptr, 1, &barrier);
-          context.SetIs8bpc(front->format == VK_FORMAT_R8G8B8A8_UNORM);
-          submitted = true;
-          return SubmitFrame();
-        });
-  }
-  if (!submitted) {
-    SubmitFrame();
-  }
+  SubmitFrame(front, std::max(frontbuffer_width, uint32_t(1)), std::max(frontbuffer_height, uint32_t(1)));
   FinishFrontDump();
 }
 
 }  // namespace rex::graphics::sdnx
+
+
+
+
+
 
 
 

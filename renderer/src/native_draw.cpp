@@ -9,8 +9,8 @@
  * (set 4, MASSEFFECT_UBO); textures and samplers go to the bindless sets 0-3 (native_texture.cpp).
  */
 #include <rex/graphics/sdnx/native_command_processor.h>
+#include <rex/graphics/sdnx/native_graphics_system.h>  // sdnx_deko3d_clip (§16.116)
 
-#include "vulkan_backend.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -27,9 +27,6 @@
 #include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
-#include <rex/ui/vulkan/device.h>
-#include <rex/ui/vulkan/provider.h>
-#include <rex/ui/vulkan/util.h>
 
 namespace rex::graphics::sdnx {
 
@@ -301,15 +298,11 @@ NativeCommandProcessor::LibraryEntry* NativeCommandProcessor::FindPixelShader(Sh
 // Resources.
 
 bool NativeCommandProcessor::InitializeDraws() {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  VkDevice vk = device->device();
   LoadLibrary();
 
   for (UploadBuffer& upload : upload_) {
     upload.gpu = backend_->CreateBuffer(kUploadBufferSize, BufferUsage::kUpload, &upload.mapping);
     if (!upload.gpu) return false;
-    upload.buffer = upload.gpu->buffer;
     upload.size = kUploadBufferSize;
   }
 
@@ -328,8 +321,7 @@ bool NativeCommandProcessor::InitializeDraws() {
     Image& image = *dummies[i];
     image.gpu = backend_->CreateImage(desc);
     if (!image.gpu) return false;
-    image.image = image.gpu->image;
-    image.view = image.gpu->view;
+    image.desc = desc;
     image.format = desc.format;
     image.width = image.height = 1;
     ViewDesc view;
@@ -338,12 +330,6 @@ bool NativeCommandProcessor::InitializeDraws() {
     view.layers = desc.layers;
     dummy_views_[i] = backend_->CreateView(image.gpu, view);
     if (!dummy_views_[i]) return false;
-    backend_->WriteImageDescriptor(desc.type, 0, dummy_views_[i]);
-  }
-  {
-    SamplerDesc sampler;
-    sampler.mag_linear = sampler.min_linear = true;
-    backend_->WriteSamplerDescriptor(0, sampler);
   }
   InitializeTextures();
   if (!InitializeGeometry()) {
@@ -358,9 +344,6 @@ bool NativeCommandProcessor::InitializeDraws() {
 }
 
 void NativeCommandProcessor::ShutdownDraws() {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  VkDevice vk = device->device();
   ShutdownTextures();
   for (auto* lib : {&library_vs_, &library_ps_}) {
     for (auto& it : *lib) backend_->DestroyShader(it.second.shader);
@@ -382,6 +365,9 @@ void NativeCommandProcessor::ShutdownDraws() {
 VkDeviceSize NativeCommandProcessor::Upload(const void* data, VkDeviceSize size, VkDeviceSize alignment,
                                             uint8_t** mapping_out) {
   UploadBuffer& upload = upload_[uint32_t(frame_ % kFramesInFlight)];
+  // §16.142: at least a cache line (64 bytes): with CPU-cached upload buffers no two allocations share a line, so
+  // cleaning one written by the CPU never writes stale bytes over a neighbour the GPU writes (resolve staging).
+  alignment = std::max<VkDeviceSize>(alignment, 64);
   VkDeviceSize offset = (upload.offset + alignment - 1) & ~(alignment - 1);
   if (offset + size > upload.size) {
     ++stats_.upload_full;
@@ -390,6 +376,9 @@ VkDeviceSize NativeCommandProcessor::Upload(const void* data, VkDeviceSize size,
   if (data) std::memcpy(upload.mapping + offset, data, size_t(size));
   if (mapping_out) *mapping_out = upload.mapping + offset;
   upload.offset = offset + size;
+  // §16.142: only what the CPU writes is cleaned; an allocation without data and without a mapping is GPU-only
+  // staging (resolves copied to the buffer and back, ~25 MB a frame), which the CPU never touches (§16.143).
+  if (data || mapping_out) backend_->NoteUploadWritten(upload.gpu, offset, offset + size);
   return offset;
 }
 
@@ -413,15 +402,14 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   }
   // SDNX_PROF=1: CPU time of the parts of a draw (state/shaders, vertices, indices, constants and textures,
   // pipeline, recording), in ReportStats.
-  static const bool prof = std::getenv("SDNX_PROF") != nullptr;
+  // §16.133: always on (the console has no environment variables; nine clock reads a draw).
+  static const bool prof = true;
   uint64_t prof_t[9] = {};
   auto prof_mark = [&](int i) {
-    if (prof) prof_t[i] = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+    if (prof) prof_t[i] = SdnxTicks();  // §16.141
   };
   prof_mark(0);
   const RegisterFile& regs = *register_file_;
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
   static const bool trace_draw = std::getenv("SDNX_TRACE_DRAW") != nullptr;
   static int trace_index = 0;
   const bool tr = trace_draw && trace_index < 200;
@@ -518,7 +506,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   // Render targets are in EDRAM samples (see GetRenderTarget): MSAA draws are drawn scaled.
   uint32_t msaa_sx = uint32_t(surface.msaa_samples >= xenos::MsaaSamples::k4X);
   uint32_t msaa_sy = uint32_t(surface.msaa_samples >= xenos::MsaaSamples::k2X);
-  uint32_t need_height = std::min(scissor.offset[1] + scissor.extent[1], uint32_t(2048));
+  uint32_t need_height = scissor.offset[1] + scissor.extent[1];
   uint32_t color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
   // A target the pixel shader does not export is left alone on Xenos; in Vulkan an attachment without a fragment
   // output gets undefined values. The confetti decals of the night market road export only colour 0 with the
@@ -581,13 +569,13 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
       area_w = std::min(area_w, colors[i]->width);
       area_h = std::min(area_h, colors[i]->height);
     }
-    rendering_key = rendering_key * 31 + uint64_t(reinterpret_cast<uintptr_t>(colors[i] ? colors[i]->image : 0));
+    rendering_key = rendering_key * 31 + uint64_t(reinterpret_cast<uintptr_t>(colors[i] ? colors[i]->gpu : nullptr));
   }
   if (depth) {
     area_w = std::min(area_w, depth->width);
     area_h = std::min(area_h, depth->height);
   }
-  rendering_key = rendering_key * 31 + uint64_t(reinterpret_cast<uintptr_t>(depth ? depth->image : 0));
+  rendering_key = rendering_key * 31 + uint64_t(reinterpret_cast<uintptr_t>(depth ? depth->gpu : nullptr));
 
   // Viewport.
   draw_util::ViewportInfo viewport;
@@ -1250,10 +1238,59 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     copy.bytes = used_bytes;
     return at;
   };
-  VkDeviceSize vs_constants = upload_reused(vs_copy, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], 4096,
-                                            used_constant_bytes(vs, 256));
-  VkDeviceSize ps_constants = upload_reused(ps_copy, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X], 224 * 16,
-                                            ps_entry ? used_constant_bytes(ps, 224) : 0);
+  // §16.139: pushed constants. The upload path copied ~2,500 blocks of up to 4 KB a frame into write-combined memory
+  // (about 20 % of this thread with the compares). The GPU keeps one persistent block per stage; per draw, the
+  // registers written since the last draw are compared with the mirror of what the GPU block holds, and only the
+  // span from the first to the last register that differs is pushed into the command stream.
+  auto push_block = [&](uint32_t block, uint8_t* mirror, const uint8_t* values, uint32_t range, uint32_t& lo,
+                        uint32_t& hi) {
+    hi = std::min(hi, range);
+    if (lo < hi) {
+      const uint32_t from = lo & ~15u, to = std::min((hi + 15u) & ~15u, range);
+      uint32_t first = UINT32_MAX, last = 0;
+      for (uint32_t o = from; o < to; o += 16) {
+        if (std::memcmp(mirror + o, values + o, 16) != 0) {
+          if (first == UINT32_MAX) first = o;
+          last = o + 16;
+        }
+      }
+      if (first != UINT32_MAX) {
+        std::memcpy(mirror + first, values + first, last - first);
+        backend_->PushConstants(block, first, mirror + first, last - first);
+        ++constant_pushes_;
+        constant_push_bytes_ += last - first;
+      } else {
+        ++stats_.constants_reused;
+      }
+    } else {
+      ++stats_.constants_reused;
+    }
+    lo = UINT32_MAX;
+    hi = 0;
+  };
+  static const bool push_constants = backend_->PushConstantsSupported() && REXCVAR_GET(sdnx_push_constants);
+  if (push_constants && !constant_mirrors_valid_) {
+    // First draw: the whole blocks once.
+    std::memcpy(vs_mirror_, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], sizeof(vs_mirror_));
+    std::memcpy(ps_mirror_, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X], sizeof(ps_mirror_));
+    backend_->PushConstants(0, 0, vs_mirror_, sizeof(vs_mirror_));
+    backend_->PushConstants(1, 0, ps_mirror_, sizeof(ps_mirror_));
+    constant_mirrors_valid_ = true;
+    vs_dirty_lo_ = ps_dirty_lo_ = UINT32_MAX;
+    vs_dirty_hi_ = ps_dirty_hi_ = 0;
+  }
+  VkDeviceSize vs_constants = 0, ps_constants = 0;
+  if (push_constants) {
+    push_block(0, vs_mirror_, reinterpret_cast<const uint8_t*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]), 4096,
+               vs_dirty_lo_, vs_dirty_hi_);
+    push_block(1, ps_mirror_, reinterpret_cast<const uint8_t*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X]),
+               224 * 16, ps_dirty_lo_, ps_dirty_hi_);
+  } else {
+    vs_constants = upload_reused(vs_copy, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], 4096,
+                                 used_constant_bytes(vs, 256));
+    ps_constants = upload_reused(ps_copy, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X], 224 * 16,
+                                 ps_entry ? used_constant_bytes(ps, 224) : 0);
+  }
   uint32_t shared[kSharedBlockSize / 4] = {};
   shared[256 / 4] = regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
   float alpha_ref = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
@@ -1261,9 +1298,12 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   auto color_control = regs.Get<reg::RB_COLORCONTROL>();
   shared[276 / 4] = uint32_t(color_control.alpha_func);
   // The library is compiled with -fvk-invert-y (the shader negates Y for Vulkan) and GetHostViewportInfo with
-  // a top-left origin flips Y as well: undo one of the two, otherwise the picture is upside down.
-  float ndc_scale[2] = {viewport.ndc_scale[0], -viewport.ndc_scale[1]};
-  float ndc_offset[2] = {viewport.ndc_offset[0], -viewport.ndc_offset[1]};
+  // a top-left origin flips Y as well: undo one of the two, otherwise the picture is upside down. Only the backend
+  // whose shaders carry the flag (Vulkan) needs this; deko3d's are built without it and Direct3D-like, so negating
+  // there throws every vertex out of the viewport (the console's black frame with alpha = 1).
+  const float ndc_y = backend_->ShaderNdcYInverted() ? -1.0f : 1.0f;
+  float ndc_scale[2] = {viewport.ndc_scale[0], viewport.ndc_scale[1] * ndc_y};
+  float ndc_offset[2] = {viewport.ndc_offset[0], viewport.ndc_offset[1] * ndc_y};
   std::memcpy(&shared[280 / 4], ndc_scale, 8);
   std::memcpy(&shared[288 / 4], ndc_offset, 8);
   float one = 1.0f;
@@ -1274,12 +1314,31 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   for (uint32_t k = 0; k < 32; ++k) shared[(624 / 4) + k / 2] |= swizzle_codes[k] << ((k & 1) * 16);
   if (pull) std::memcpy(&shared[kPullInfoOffset / 4], pull_info, sizeof(pull_info));
   uint32_t spec = kSpecConstantsUbo;
-  if (color_control.alpha_test_enable && ps_entry) {
+  // §16.130: ALWAYS (7) never discards: no alpha test, so deko3d can bind the variant without discard (early Z).
+  if (color_control.alpha_test_enable && ps_entry && uint32_t(color_control.alpha_func) != 7) {
     spec |= kSpecAlphaTest | (uint32_t(color_control.alpha_func) << 16);
   }
+  // §16.115: deko3d's vertex shaders clip to Direct3D's 0 <= z <= w themselves (gl_ClipDistance, dk_build.py) when
+  // Xenos clipping is on: the hardware clamps instead of clipping at the near plane there. Vulkan clips natively and
+  // its pipelines are keyed by spec, so the bit is only set for deko3d.
+  // §16.116: the first try (all draws) erased most of the scene on the console; off unless sdnx_deko3d_clip is set.
+  static const bool deko3d_clip = std::strcmp(backend_->name(), "deko3d") == 0 && REXCVAR_GET(sdnx_deko3d_clip);
+  if (deko3d_clip && !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) spec |= 1u << 30;
   // Byte 616 (free between _InvSize and g_FetchSwizzle): the pipeline's specialization value, which the deko3d
   // shaders read instead of a specialization constant (shader_common.h, SDNX_DK_SPEC_OFFSET).
   shared[616 / 4] = spec;
+  // §16.123: guest pixels per host pixel for the pixel shaders' position register (shader_common.h g_PixelScale).
+  // §16.124: only for draws into scaled targets (the 1280-wide output surfaces are not scaled).
+  const Image* first_target = depth;
+  for (uint32_t i = 0; i < color_count; ++i) {
+    if (colors[i]) {
+      first_target = colors[i];
+      break;
+    }
+  }
+  const bool target_scaled = first_target && first_target->desc.scaled;
+  const float pixel_scale = target_scaled ? 1.0f / backend_->RenderScale() : 1.0f;
+  std::memcpy(&shared[620 / 4], &pixel_scale, 4);
   BindTextures(vs, ps_entry ? ps : nullptr, shared);
   VkDeviceSize shared_constants = upload_reused(shared_copy, shared, sizeof(shared), sizeof(shared));
   if (vs_constants == UINT64_MAX || ps_constants == UINT64_MAX || shared_constants == UINT64_MAX) {
@@ -1321,6 +1380,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
                  uint32_t(mode_cntl.face != 0) << 2;
       // SDNX_FLIP_FACE1=1: diagnostic, the front face of the draws with the face bit set (light volumes) inverted.
       static const bool flip_face1 = std::getenv("SDNX_FLIP_FACE1") != nullptr;
+      // (§16.110 tried the same on deko3d's swap 1830: the stencil marking did not change, removed in §16.111.)
       if (flip_face1 && mode_cntl.face != 0) packet.cull &= ~4u;
     }
   }
@@ -1373,7 +1433,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
                 regs[XE_GPU_REG_RB_STENCILREFMASK], packet.cull, regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL], scissor.offset[0],
                 scissor.offset[1], scissor.extent[0],
                 scissor.extent[1], uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base),
-                uint64_t(reinterpret_cast<uintptr_t>(depth ? depth->image : 0)),
+                uint64_t(reinterpret_cast<uintptr_t>(depth ? depth->gpu : nullptr)),
                 depth ? depth->width : 0, depth ? depth->height : 0, uint32_t(surface.msaa_samples), binding_count,
                 rect_count, vs_entry->name.substr(vs_entry->name.find_last_of("/\\") + 1),
                 ps_entry ? ps_entry->name.substr(ps_entry->name.find_last_of("/\\") + 1) : "-", textures);
@@ -1408,7 +1468,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
       for (auto& it : render_targets_) {
         Image& target = it.second;
         bool is_depth = (it.first >> 38) & 1;
-        if (is_depth || (it.first & 0xFFFFFFF) != base_pitch || !target.image) continue;
+        if (is_depth || (it.first & 0xFFFFFFF) != base_pitch || !target.gpu) continue;
         if (target.format != VK_FORMAT_R8G8B8A8_UNORM && target.format != VK_FORMAT_R8G8B8A8_SRGB) continue;
         int32_t cx1 = std::min(x1, int32_t(target.width)), cy1 = std::min(y1, int32_t(target.height));
         if (x0 < 0 || y0 < 0 || cx1 <= x0 || cy1 <= y0) continue;
@@ -1416,7 +1476,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
         FullBarrier();
         backend_->ClearAttachmentRect(target.gpu, VkRect2D{{x0, y0}, {uint32_t(cx1 - x0), uint32_t(cy1 - y0)}},
                                       clear_rgba);
-        attachments_written_.push_back(target.image);  // written as an attachment (see BeginPassBarrier)
+        attachments_written_.push_back(target.gpu);  // written as an attachment (see BeginPassBarrier)
         target.drawn = true;
         ++stats_.clears;
         if (log_frame_) {
@@ -1425,6 +1485,21 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
         }
       }
     }
+  }
+  // §16.108: on the frame log, the stencil and depth a stencil-EQUAL draw (the sun shadow collectors, the lighting)
+  // tests against, probed outside the pass just before it.
+  if (log_frame_ && depth && depth_control.stencil_enable &&
+      depth_control.stencilfunc == xenos::CompareFunction::kEqual && stencil_probes_ < 14) {
+    ++stencil_probes_;
+    EndRendering();
+    ImageRegion probed;
+    probed.x = int32_t(std::min(scissor.offset[0] << msaa_sx, area_w));
+    probed.y = int32_t(std::min(scissor.offset[1] << msaa_sy, area_h));
+    probed.width = std::min(scissor.extent[0] << msaa_sx, area_w - uint32_t(probed.x));
+    probed.height = std::min(scissor.extent[1] << msaa_sy, area_h - uint32_t(probed.y));
+    REXGPU_INFO("[sdnx_frame] stencil probe before draw (ref {:#x}): depth base {}",
+                regs[XE_GPU_REG_RB_STENCILREFMASK], uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base));
+    backend_->DebugProbe(depth->gpu, probed, regs.Get<reg::RB_DEPTH_INFO>().depth_base, "before-equal");
   }
   // Record.
   if (tr) {
@@ -1438,9 +1513,9 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   if (!rendering_ || rendering_key_ != rendering_key) {
     EndRendering();
     {
-      VkImage pass_images[5] = {};
-      for (uint32_t i = 0; i < color_count; ++i) pass_images[i] = colors[i] ? colors[i]->image : VK_NULL_HANDLE;
-      pass_images[4] = depth ? depth->image : VK_NULL_HANDLE;
+      GpuImage* pass_images[5] = {};
+      for (uint32_t i = 0; i < color_count; ++i) pass_images[i] = colors[i] ? colors[i]->gpu : nullptr;
+      pass_images[4] = depth ? depth->gpu : nullptr;
       BeginPassBarrier(pass_images, 5);
     }
     backend_->BeginRendering(packet.colors, color_count, packet.depth, area_w, area_h);
@@ -1486,6 +1561,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     packet.depth_bias_constant = bias_constant;
     packet.depth_bias_slope = bias_slope;
   }
+  packet.pushed_constants = push_constants;  // §16.139
   packet.constants[0] = {upload.gpu, vs_constants};
   packet.constants[1] = {upload.gpu, ps_constants};
   packet.constants[2] = {upload.gpu, shared_constants};

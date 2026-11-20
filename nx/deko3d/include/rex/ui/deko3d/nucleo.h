@@ -100,7 +100,12 @@ class Dispositivo {
 
 struct ConfigNucleo {
   uint32_t ranuras = 3;              // work slots: the CPU records one while the GPU runs the others
+  // SDNX §16.133: submits the GPU may still have to run when the CPU submits another (MarcarEnvio), 2..kVallasEnvio.
+  uint32_t envios_en_vuelo = 2;
   uint32_t mb_subida = 64;           // per slot: vertices, indices, constants, texture uploads
+  // SDNX §16.141: the upload ring CPU-cached (fast writes); what was reserved since the last submit is cleaned from
+  // the CPU cache before each submit (LimpiarSubida). false = uncached (write-combined) as before.
+  bool subida_cacheada = false;
   uint32_t kb_comandos = 4096;       // per slot: command memory (it grows past this with extra blocks)
   // per slot: command memory of the pre-list (ComandosPrevios); 0 = no pre-list
   uint32_t kb_previos = 0;
@@ -179,6 +184,12 @@ class Nucleo {
   uint64_t NsEsperandoValla() const { return ns_esperando_valla_; }
   // Submits what was recorded so far in the middle of a slot (without its fence) and keeps recording.
   void EnviarParcial();
+  // §16.141: cleans from the CPU cache what the slot reserved since the last submit (cached ring only).
+  void LimpiarSubida();
+  uint64_t BytesLimpiados() const { return bytes_limpiados_; }
+  // SDNX §16.106: submits so far, and how many of them waited for the GPU (see vallas_envio_).
+  uint64_t Envios() const { return envios_; }
+  uint64_t EsperasEnvio() const { return esperas_envio_; }
   // Waits until the GPU is idle (at the end, or before freeing things whose last use is unknown).
   void EsperarGpu() { disp_->EsperarInactiva(); }
 
@@ -233,6 +244,7 @@ class Nucleo {
     DkFence valla{};
     bool vallada = false;
     uint32_t subida_usada = 0;
+    uint32_t subida_limpia = 0;  // §16.141: bytes of the slot already cleaned from the CPU cache
     MemoriaRanura comandos, previos;
     std::vector<BloqueImagen> por_liberar;
   };
@@ -254,6 +266,16 @@ class Nucleo {
   DkCmdBuf previos_ = nullptr;
   bool previos_usados_ = false;
   uint64_t ns_esperando_valla_ = 0;
+  uint64_t bytes_limpiados_ = 0;
+  // SDNX §16.106: every submit (partial or the end of a work) ends with its own fence, and before a submit the CPU
+  // waits until the GPU has passed the one two submits back. The kernel's gpfifo of the channel holds 0x800 entries
+  // not yet fetched by the GPU; with the GPU far behind (several frames of barriers, blits and resolves) a submit
+  // did not fit and dkQueueFlush failed ("gpu channel kickoff failed, but no error was reported").
+  static constexpr uint32_t kVallasEnvio = 8;
+  DkFence vallas_envio_[kVallasEnvio]{};
+  uint64_t envios_ = 0;
+  uint64_t esperas_envio_ = 0;
+  void MarcarEnvio();
   DkMemBlock memoria_previos_ = nullptr;
   DkMemBlock subida_ = nullptr, memoria_comandos_ = nullptr, codigo_ = nullptr, descriptores_ = nullptr,
              consultas_ = nullptr;

@@ -106,6 +106,10 @@ struct MassEffectSharedBlock { float4 v[31]; };
 // shader (K = order of first emission, listed by the "SDNX_FETCH_ORDER" comment at the end of the HLSL),
 // two per word: bits 0-11 even K, bits 16-27 odd K, at byte 624 + (K / 2) * 4 of the shared constants.
 #define g_FetchSwizzle(K)          (((MASSEFFECT_UBO ? MASSEFFECT_SHARED_UINT(624 + ((K) / 2) * 4) : SDNX_RAW_LOAD<uint>(g_PushConstants.SharedConstants + 624 + ((K) / 2) * 4)) >> (((K) & 1) * 16)) & 0xFFF)
+// SDNX §16.123: guest pixels per host pixel (1 / render scale) at byte 620 of the shared constants. The deko3d package
+// (dk_build.py) multiplies the pixel shaders' position register (iPos.xy) by it, so a scaled render target still gives
+// the shader guest pixel positions.
+#define g_PixelScale               MASSEFFECT_SHARED_FLOAT(620)
 
 #ifdef SDNX_FETCH_SWIZZLE
 // SDNX: vertex shaders that compute the index of their vertex fetches (hand-made instancing: the index is read
@@ -113,7 +117,25 @@ struct MassEffectSharedBlock { float4 v[31]; };
 // buffer (binding 3) and gives fetch K, at byte 688 + K * 16 of the shared block: the byte offset of its first
 // element, the stride in bytes, the VkFormat Direct3D's fetch word maps to, the number of vertices. The data is
 // in host word order (as for vertex attributes), so the components are read like Vulkan reads that format.
+#ifdef SDNX_DEKO3D
+// SDNX §16.105: on the console a storage-buffer load (LDG) lost the high word of its 64-bit address in some runs and
+// page-faulted (0x5_xxxxxxxx read as 0x0_xxxxxxxx) although the descriptor and the machine code were right. The
+// pulled vertices are read through a buffer texture instead (texelFetch, R32_UINT, the texture path and its 40-bit
+// descriptor that every other texture uses). dk_build.py gives it texture binding 31 of the vertex stage; the
+// backend binds the whole upload buffer there. Same Load/Load2/Load3/Load4 as ByteAddressBuffer, byte offsets.
+[[vk::binding(3, 4)]] Buffer<uint> g_PullTexels;
+struct SdnxPullBuffer
+{
+    uint unused;
+    uint Load(uint a) { return g_PullTexels.Load(int(a >> 2)); }
+    uint2 Load2(uint a) { return uint2(Load(a), Load(a + 4)); }
+    uint3 Load3(uint a) { return uint3(Load(a), Load(a + 4), Load(a + 8)); }
+    uint4 Load4(uint a) { return uint4(Load(a), Load(a + 4), Load(a + 8), Load(a + 12)); }
+};
+static SdnxPullBuffer g_PullData;
+#else
 [[vk::binding(3, 4)]] ByteAddressBuffer g_PullData;
+#endif
 
 float sdnxSnorm(int v, int bits)
 {
@@ -206,7 +228,13 @@ float4 sdnxPullFetch(uint k, float indexValue, uint rounded)
 // shared constants (byte 616, a free word between _InvSize and g_FetchSwizzle: the renderer writes the pipeline's
 // specialization value there); the other bits are the values the renderer always uses (CONSTANTS_UBO only).
 #define SDNX_DK_SPEC_OFFSET 616
+#ifdef SDNX_NO_ALPHA_TEST
+// SDNX §16.129: the variant bound while the alpha test is off (<name>_nat.dksh): without its discard the GPU tests
+// depth before shading (early Z), as Xenos' Hi-Z rejected hidden pixels.
+#define g_SpecConstants() (SPEC_CONSTANT_CONSTANTS_UBO)
+#else
 #define g_SpecConstants() (SPEC_CONSTANT_CONSTANTS_UBO | (MASSEFFECT_SHARED_UINT(SDNX_DK_SPEC_OFFSET) & (SPEC_CONSTANT_ALPHA_TEST | SPEC_CONSTANT_ALPHA_FUNC_MASK)))
+#endif
 #else
 [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
 
@@ -519,6 +547,8 @@ float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
 
 // SDNX: a vertex fetch with a run-time destination swizzle (Xenos FetchDestinationSwizzle, 3 bits per
 // component: 0-3 = data component, 4 = 0, 5 = 1, 6 and 7 = keep the register's component).
+// (SDNX §16.121 tried constant-index picks here: uam already compiled the loop without local memory (0 LDL/STL in all
+// 539 vertex shaders) and the picks were 7% more instructions, so the loop stays.)
 float4 fetchApply(float4 previous, float4 value, uint code)
 {
     float4 result = previous;

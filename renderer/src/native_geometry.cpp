@@ -12,7 +12,6 @@
  */
 #include <rex/graphics/sdnx/native_command_processor.h>
 
-#include "vulkan_backend.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -20,8 +19,6 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/system/xmemory.h>
-#include <rex/ui/vulkan/device.h>
-#include <rex/ui/vulkan/util.h>
 
 namespace rex::graphics::sdnx {
 
@@ -52,6 +49,42 @@ VkDeviceSize AllocateFrom(std::map<VkDeviceSize, VkDeviceSize>& free_blocks, VkD
   return UINT64_MAX;
 }
 
+// §16.139: best fit through the size index.
+VkDeviceSize AllocateFrom(FreeBlocks& free_blocks, VkDeviceSize size) {
+  size = (size + kGeometryAlignment - 1) & ~(kGeometryAlignment - 1);
+  auto it = free_blocks.by_size.lower_bound({size, 0});
+  if (it == free_blocks.by_size.end()) return UINT64_MAX;
+  const VkDeviceSize block_size = it->first, offset = it->second, left = block_size - size;
+  free_blocks.by_size.erase(it);
+  free_blocks.by_offset.erase(offset);
+  if (left) {
+    free_blocks.by_offset[offset + size] = left;
+    free_blocks.by_size.insert({left, offset + size});
+  }
+  return offset;
+}
+
+void FreeTo(FreeBlocks& free_blocks, VkDeviceSize offset, VkDeviceSize size) {
+  size = (size + kGeometryAlignment - 1) & ~(kGeometryAlignment - 1);
+  auto next = free_blocks.by_offset.lower_bound(offset);
+  if (next != free_blocks.by_offset.end() && offset + size == next->first) {  // merge with the following block
+    free_blocks.by_size.erase({next->second, next->first});
+    size += next->second;
+    next = free_blocks.by_offset.erase(next);
+  }
+  if (next != free_blocks.by_offset.begin()) {  // merge with the preceding block
+    auto prev = std::prev(next);
+    if (prev->first + prev->second == offset) {
+      free_blocks.by_size.erase({prev->second, prev->first});
+      prev->second += size;
+      free_blocks.by_size.insert({prev->second, prev->first});
+      return;
+    }
+  }
+  free_blocks.by_offset[offset] = size;
+  free_blocks.by_size.insert({size, offset});
+}
+
 void FreeTo(std::map<VkDeviceSize, VkDeviceSize>& free_blocks, VkDeviceSize offset, VkDeviceSize size) {
   size = (size + kGeometryAlignment - 1) & ~(kGeometryAlignment - 1);
   auto next = free_blocks.lower_bound(offset);
@@ -71,8 +104,6 @@ void FreeTo(std::map<VkDeviceSize, VkDeviceSize>& free_blocks, VkDeviceSize offs
 }  // namespace
 
 bool NativeCommandProcessor::InitializeGeometry() {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  uint32_t memory_type;
   // The page-watched geometry cache is off by default (see CachedGeometry): its 192 MB buffer is only made when it
   // is turned on. On the console that memory ran out after ~6 minutes of gameplay.
   geometry_free_.clear();
@@ -83,7 +114,7 @@ bool NativeCommandProcessor::InitializeGeometry() {
   }
   hashed_gpu_ = backend_->CreateBuffer(kHashedBufferSize, BufferUsage::kGeometry, &hashed_mapping_);
   hashed_free_.clear();
-  if (hashed_gpu_ && hashed_mapping_) hashed_free_[0] = kHashedBufferSize;
+  if (hashed_gpu_ && hashed_mapping_) FreeTo(hashed_free_, 0, kHashedBufferSize);
   return true;
 }
 

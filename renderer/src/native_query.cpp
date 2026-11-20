@@ -10,7 +10,6 @@
  */
 #include <rex/graphics/sdnx/native_command_processor.h>
 
-#include "vulkan_backend.h"
 
 #include <algorithm>
 #include <cstring>
@@ -19,8 +18,6 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
-#include <rex/ui/vulkan/device.h>
-#include <rex/ui/vulkan/util.h>
 
 namespace rex::graphics::sdnx {
 
@@ -28,74 +25,40 @@ namespace {
 constexpr uint32_t kFirstFrameSamples = 1000;  // before a real count exists: visible, as the base class
 }
 
+// Pools and readback buffers are the backend's (kMaxQueries per slot); here the guest queries are mapped onto them.
 bool NativeCommandProcessor::InitializeQueries() {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
-    VkQueryPoolCreateInfo info = {};
-    info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-    info.queryType = VK_QUERY_TYPE_OCCLUSION;
-    info.queryCount = kMaxQueries;
-    if (dfn.vkCreateQueryPool(device->device(), &info, nullptr, &query_pools_[slot]) != VK_SUCCESS) return false;
-    uint32_t memory_type;
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            device, sizeof(uint64_t) * kMaxQueries, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            ui::vulkan::util::MemoryPurpose::kReadback, query_readback_[slot], query_readback_memory_[slot],
-            &memory_type)) {
-      return false;
-    }
-    void* mapping = nullptr;
-    dfn.vkMapMemory(device->device(), query_readback_memory_[slot], 0, VK_WHOLE_SIZE, 0, &mapping);
-    query_readback_mapping_[slot] = static_cast<const uint64_t*>(mapping);
-  }
+  static_assert(kMaxQueries == GpuBackend::kMaxQueries);
   return true;
 }
 
-void NativeCommandProcessor::ShutdownQueries() {
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  const ui::vulkan::VulkanDevice::Functions& dfn = device->functions();
-  for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
-    if (query_pools_[slot]) dfn.vkDestroyQueryPool(device->device(), query_pools_[slot], nullptr);
-    if (query_readback_[slot]) dfn.vkDestroyBuffer(device->device(), query_readback_[slot], nullptr);
-    if (query_readback_memory_[slot]) dfn.vkFreeMemory(device->device(), query_readback_memory_[slot], nullptr);
-    query_pools_[slot] = VK_NULL_HANDLE;
-    query_readback_[slot] = VK_NULL_HANDLE;
-    query_readback_memory_[slot] = VK_NULL_HANDLE;
-    query_readback_mapping_[slot] = nullptr;
-  }
-}
+void NativeCommandProcessor::ShutdownQueries() {}
 
 void NativeCommandProcessor::BeginHostQuery() {
   uint32_t slot = uint32_t(frame_ % kFramesInFlight);
-  if (!guest_query_active_ || host_query_open_ || !rendering_ || !query_pools_[slot] ||
-      query_used_[slot] >= kMaxQueries) {
-    return;
-  }
-  const ui::vulkan::VulkanDevice* device = vulkan_device();
-  uint32_t index = query_used_[slot]++;
-  device->functions().vkCmdBeginQuery(cb_, query_pools_[slot], index,
-                                      device->properties().occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+  if (!guest_query_active_ || host_query_open_ || !rendering_ || query_used_[slot] >= kMaxQueries) return;
+  uint32_t index = query_used_[slot];
+  if (!backend_->BeginQuery(slot, index)) return;  // no queries: the guest gets the fixed count
+  ++query_used_[slot];
   guest_query_indices_.push_back(index);
   host_query_open_ = true;
 }
 
 void NativeCommandProcessor::EndHostQuery() {
   if (!host_query_open_) return;
-  vulkan_device()->functions().vkCmdEndQuery(cb_, query_pools_[uint32_t(frame_ % kFramesInFlight)],
-                                             guest_query_indices_.back());
+  backend_->EndQuery(uint32_t(frame_ % kFramesInFlight), guest_query_indices_.back());
   host_query_open_ = false;
 }
 
 void NativeCommandProcessor::ResetQueries(uint32_t slot) {
   // The slot's frame has completed (its fence was waited for): its counts are in the readback buffer.
-  const uint64_t* results = query_readback_mapping_[slot];
+  const uint64_t* results = backend_->QueryResults(slot);
   for (const PendingQuery& query : pending_queries_[slot]) {
     uint64_t samples = 0;
     for (uint32_t index : query.indices) samples += results ? results[index] : 0;
     query_results_[query.address] = uint32_t(std::min<uint64_t>(samples, 0xFFFFFFFFu));
   }
   pending_queries_[slot].clear();
-  if (query_pools_[slot]) vulkan_device()->functions().vkCmdResetQueryPool(cb_, query_pools_[slot], 0, kMaxQueries);
+  backend_->ResetQueries(slot, kMaxQueries);
   query_used_[slot] = 0;
 }
 
@@ -104,9 +67,7 @@ void NativeCommandProcessor::CopyQueryResults(uint32_t slot) {
   // with that frame's pool; what was counted here is dropped (rare: queries are short).
   if (guest_query_active_) guest_query_indices_.clear();
   if (!query_used_[slot]) return;
-  vulkan_device()->functions().vkCmdCopyQueryPoolResults(cb_, query_pools_[slot], 0, query_used_[slot],
-                                                         query_readback_[slot], 0, sizeof(uint64_t),
-                                                         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+  backend_->ResolveQueries(slot, query_used_[slot]);
   transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
 }
 
@@ -143,7 +104,7 @@ bool NativeCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
     EndHostQuery();
     if (!guest_query_indices_.empty()) {
       pending_queries_[uint32_t(frame_ % kFramesInFlight)].push_back({address, std::move(guest_query_indices_)});
-    } else if (known == query_results_.end() && query_pools_[uint32_t(frame_ % kFramesInFlight)]) {
+    } else if (known == query_results_.end() && backend_->QueryResults(uint32_t(frame_ % kFramesInFlight))) {
       query_results_[address] = 0;  // nothing was drawn while it was open
     }
     guest_query_indices_.clear();

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Sleeping Dogs port (SDNX): the GPU backend of the native renderer.
  *
  * NativeCommandProcessor decides everything a Xenos draw, resolve or swap needs (render targets in EDRAM-lite,
@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 
 // As rex/ui/vulkan/api.h (which may be included after this): its vulkan.hpp needs the beta extensions declared.
 #ifndef VK_NO_PROTOTYPES
@@ -30,6 +31,10 @@
 #define VK_ENABLE_BETA_EXTENSIONS
 #endif
 #include <vulkan/vulkan_core.h>
+
+namespace rex::graphics {
+class GraphicsSystem;
+}
 
 namespace rex::graphics::sdnx {
 
@@ -50,6 +55,9 @@ struct ImageDesc {
   bool render_target = false;  // colour attachment
   bool depth_stencil = false;  // depth / stencil attachment (format D32_SFLOAT_S8_UINT)
   bool mutable_format = false; // views of another format of the same size (SNORM views of UNORM textures)
+  // SDNX §16.123: derived from EDRAM (render targets, resolves): a backend with a render scale below 1 allocates it
+  // smaller and maps every region, viewport and scissor given for it in guest pixels.
+  bool scaled = false;
 };
 
 enum class BufferUsage : uint8_t {
@@ -133,6 +141,9 @@ struct DrawPacket {
   // Constants: VS (4096 bytes), PS (3584), shared block (944) in the frame's upload ring.
   BufferRef constants[3];
   uint32_t constant_sizes[3] = {};
+  // SDNX §16.139: VS / PS constants live in the backend's persistent blocks, updated with PushConstants (constants[0]
+  // still names the upload ring, which the pulling vertex shaders read).
+  bool pushed_constants = false;
   // The shared block as written (texture and sampler descriptor numbers per Xenos slot): deko3d binds each shader's
   // texture bindings from it. 236 words.
   const uint32_t* shared = nullptr;
@@ -148,19 +159,27 @@ class GpuBackend {
  public:
   static constexpr uint32_t kFramesInFlight = 3;
   static constexpr uint32_t kHeapSize = 4096;  // image descriptors per heap, samplers
+  static constexpr uint32_t kMaxQueries = 4096;  // occlusion queries per frame slot
 
   virtual ~GpuBackend() = default;
 
   virtual bool Initialize() = 0;
   virtual void Shutdown() = 0;  // waits for the GPU first
   virtual const char* name() const = 0;
+  // The shaders of this backend are compiled with the clip-space Y inverted for Vulkan (-fvk-invert-y), so the
+  // frontend negates the NDC Y in the shared constants. deko3d is Direct3D-like (top-left origin, no inversion)
+  // and its shaders are built without the flag: negating there puts every vertex outside the viewport.
+  virtual bool ShaderNdcYInverted() const { return true; }
+  // SDNX §16.123: host pixels per guest pixel of the scaled images (ImageDesc::scaled); the pixel shaders get 1/scale.
+  virtual float RenderScale() const { return 1.0f; }
   // The shader package folder next to the executable and its file extension (the index is the same for both).
   virtual const char* ShaderPackage() const = 0;
   virtual const char* ShaderExtension() const = 0;
   // Bytes of a buffer the pulling vertex shaders can read through storage buffer 3 (from its start).
   virtual uint64_t MaxStorageBufferRange() const = 0;
-  // Statistics: pipelines (or state objects) made so far.
+  // Statistics: pipelines (or state objects) made so far; draws whose constants binding was skipped (cumulative).
   virtual uint64_t pipelines_created() const { return 0; }
+  virtual uint64_t constants_bind_skipped() const { return 0; }
 
   // ---- Frames
   // Waits for the slot's fence and starts recording into it.
@@ -204,6 +223,24 @@ class GpuBackend {
   virtual void CopyImageToBuffer(GpuImage* source, const ImageRegion& from, Aspect aspect, BufferRef destination,
                                  uint32_t row_length) = 0;
   virtual void CopyBuffer(BufferRef source, BufferRef destination, uint64_t size) = 0;
+  // Diagnostic (SDNX §16.108): samples a few blocks of `region` once the commands so far are done and logs channel
+  // statistics after the frame, tagged with the guest address. No-op unless a backend implements it.
+  // SDNX §16.132: nanoseconds the calling thread has spent waiting for the GPU (fences), cumulative.
+  virtual uint64_t CpuWaitNs() const { return 0; }
+  // SDNX §16.139: persistent constant blocks (0: VS, 4096 bytes; 1: PS, 3584) updated in the command stream, in a
+  // pipelined way (each later draw sees the new bytes, earlier ones the old). Only when supported.
+  virtual bool PushConstantsSupported() const { return false; }
+  // SDNX §16.142: the frontend wrote [begin, end) of a kUpload buffer's mapping (a backend whose upload buffers are
+  // CPU-cached cleans that range from the cache before the GPU can read it).
+  virtual void NoteUploadWritten(GpuBuffer* buffer, uint64_t begin, uint64_t end) {
+    (void)buffer; (void)begin; (void)end;
+  }
+  virtual void PushConstants(uint32_t block, uint32_t offset, const void* data, uint32_t size) {
+    (void)block; (void)offset; (void)data; (void)size;
+  }
+  virtual void DebugProbe(GpuImage* image, const ImageRegion& region, uint32_t tag, const char* kind) {
+    (void)image; (void)region; (void)tag; (void)kind;
+  }
 
   // ---- Ordering. Full: everything before, before everything after. Attachments: only attachment writes of earlier
   // passes before attachment access of later ones.
@@ -224,7 +261,8 @@ class GpuBackend {
   // Fills a rectangle of a colour target as an attachment (EDRAM aliasing of depth clears).
   virtual void ClearAttachmentRect(GpuImage* target, const VkRect2D& rect, const float rgba[4]) = 0;
 
-  // ---- Occlusion queries: one host query per rendering pass instance a guest query spans.
+  // ---- Occlusion queries: one host query per rendering pass instance a guest query spans. BeginQuery is false when
+  // the backend has no queries (the guest then gets fixed counts).
   virtual bool BeginQuery(uint32_t slot, uint32_t index) = 0;  // inside the open pass
   virtual void EndQuery(uint32_t slot, uint32_t index) = 0;
   virtual void ResetQueries(uint32_t slot, uint32_t count) = 0;
@@ -232,10 +270,14 @@ class GpuBackend {
   virtual void ResolveQueries(uint32_t slot, uint32_t count) = 0;
   virtual const uint64_t* QueryResults(uint32_t slot) = 0;  // after the slot's fence
 
-  // ---- Output: the front image scaled into the presenter's guest output (width x height); submits the frame.
-  // false: not presented (the frontend submits the frame itself).
+  // ---- Output: the front image scaled into the presenter's guest output (width x height), then the slot is
+  // submitted. false: nothing was presented or submitted (no presenter, or it declined): the frontend submits.
   virtual bool Present(uint32_t slot, GpuImage* front, uint32_t front_width, uint32_t front_height, uint32_t width,
                        uint32_t height, bool is_8bpc) = 0;
 };
 
+// The Vulkan backend on the graphics system's Vulkan provider and presenter (vulkan_backend.cpp).
+std::unique_ptr<GpuBackend> CreateVulkanBackend(GraphicsSystem* graphics_system);
+
 }  // namespace rex::graphics::sdnx
+

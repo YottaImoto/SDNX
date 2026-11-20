@@ -23,7 +23,41 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 COMMON = os.path.join(HERE, '..', 'XenosRecomp', 'shader_common.h')
 DXC = os.environ.get('DXC', os.path.expanduser('~/tools/dxc/bin/dxc'))
 CROSS = os.environ.get('SPIRV_CROSS', os.path.expanduser('~/tools/spirv-cross-build/spirv-cross'))
-UAM = os.environ.get('UAM', os.path.expanduser('~/tools/uam'))
+# §16.104: the patched uam (SwitchWakerHD: deterministic scheduling, no dual issue); stock uam 1.1.0 is not.
+UAM = os.environ.get('UAM', os.path.expanduser('~/tools/uam-reference-build/uam'))
+# §16.105: the pulled-vertex buffer texture (shader_common.h, g_PullTexels) takes the last vertex texture binding.
+PULL_BINDING = 31
+PULL_RE = re.compile(r'^(?:layout\(binding = \d+\) )?uniform usamplerBuffer (\w+);$', re.M)
+# §16.115: deko3d writes ViewVolumeClipControl = 0x181D without depth clamp (DepthClampNear/Far set), so geometry
+# in front of the near plane is not clipped: the far shadow cascades' boxes crossing it drew at depth 0 over the whole
+# screen. Direct3D's view volume (0 <= z <= w) is restored with two clip distances, written after the shader's own
+# main when the frontend sets bit 30 of the spec word (shared block byte 616 = v[38].z: Xenos clipping enabled).
+CLIP_WRAPPER = '''
+void main()
+{
+    sdnx_vs_main();
+    bool sdnx_clip = (floatBitsToUint(g_UboShared.v[38].z) & 0x40000000u) != 0u;
+    gl_ClipDistance[0] = sdnx_clip ? gl_Position.z : 1.0;
+    gl_ClipDistance[1] = sdnx_clip ? gl_Position.w - gl_Position.z : 1.0;
+    // §16.116: deko3d enables all eight clip distances (ClipDistanceEnable 0xFF): every one is written.
+    gl_ClipDistance[2] = 1.0;
+    gl_ClipDistance[3] = 1.0;
+    gl_ClipDistance[4] = 1.0;
+    gl_ClipDistance[5] = 1.0;
+    gl_ClipDistance[6] = 1.0;
+    gl_ClipDistance[7] = 1.0;
+}
+'''
+
+
+def add_near_far_clip(glsl):
+    """Vertex shaders: Direct3D near/far clipping through gl_ClipDistance (see CLIP_WRAPPER)."""
+    if 'g_UboShared' not in glsl or 'gl_ClipDistance' in glsl:
+        return glsl
+    renamed, count = re.subn(r'^void main\(\)$', 'void sdnx_vs_main()', glsl, flags=re.M)
+    if count != 1:
+        raise ValueError('vertex shader main not found once (%d)' % count)
+    return renamed.rstrip('\n') + '\n' + CLIP_WRAPPER
 ENV = dict(os.environ, LD_LIBRARY_PATH=os.path.expanduser('~/tools/dxc/lib'))
 
 FORBIDDEN = ('GL_EXT_buffer_reference', 'GL_ARB_gpu_shader_int64', 'GL_EXT_shader_explicit_arithmetic_types',
@@ -80,7 +114,12 @@ def bind_textures(glsl):
                 glsl = glsl.replace(name, real[0])
                 del found[name]
     order = sorted(found.items(), key=lambda kv: (kv[1][1], kv[1][0]))
-    if len(order) > 32:
+    pulls = PULL_RE.findall(glsl)
+    if len(pulls) > 1 or (pulls and 'g_PullTexels' not in pulls[0]):
+        raise ValueError('unexpected buffer textures: %s' % pulls)
+    if pulls:
+        glsl = PULL_RE.sub('layout(binding = %d) uniform usamplerBuffer %s;' % (PULL_BINDING, pulls[0]), glsl)
+    if len(order) > (PULL_BINDING if pulls else 32):
         raise ValueError('%d textures, deko3d has 32 per stage' % len(order))
     table = []
     for binding, (name, (dim, slot, kind)) in enumerate(order):
@@ -106,6 +145,8 @@ def compile_one(src, work, stage=None, defines=('SDNX_DEKO3D',), name=None):
         text = refresh_common(open(src, encoding='utf-8', errors='replace').read())
     except Exception as e:
         return fail('common', str(e))
+    # §16.123: the position register in guest pixels when the render targets are scaled (shader_common.h g_PixelScale).
+    text = text.replace('(iPos.xy - 0.5)', '(iPos.xy * g_PixelScale - 0.5)')
     h = os.path.join(work, 'hlsl', name + '.hlsl')
     open(h, 'w').write(text)
     spv = os.path.join(work, 'spv', name + '.spv')
@@ -130,6 +171,8 @@ def compile_one(src, work, stage=None, defines=('SDNX_DEKO3D',), name=None):
         return fail('ubo', 'dynamic component index into a UBO vector: ' + m.group(0))
     try:
         glsl, table = bind_textures(glsl)
+        if stage == 'vert':
+            glsl = add_near_far_clip(glsl)
     except Exception as e:
         return fail('bind', str(e))
     open(gl, 'w').write(glsl)
@@ -164,21 +207,34 @@ def main():
         src = source(name)
         if not src:
             return name, 'source', 'no HLSL in %s or %s' % (hlsl_dir, internal), None
-        return compile_one(src, work, 'frag' if kind == 'ps' else 'vert', name=name)
+        result = compile_one(src, work, 'frag' if kind == 'ps' else 'vert', name=name)
+        # §16.129: pixel shaders also without the alpha test (SDNX_NO_ALPHA_TEST, shader_common.h): bound while the
+        # alpha test is off. Kept only when it has no discard left (the gain is early Z) and the same textures.
+        if kind == 'ps' and result[1] == 'ok':
+            nat = compile_one(src, work, 'frag', defines=('SDNX_DEKO3D', 'SDNX_NO_ALPHA_TEST'), name=name + '_nat')
+            gl = os.path.join(work, 'glsl', name + '_nat.glsl')
+            if nat[1] == 'ok' and nat[3] == result[3] and 'discard' not in open(gl).read():
+                return result + (True,)
+        return result + (False,)
     with ThreadPoolExecutor(jobs) as ex:
         results = list(ex.map(job, entries))
-    index, textures, failed = [], [], []
-    for line, (name, status, why, table) in zip(entries, results):
+    index, textures, failed, nat = [], [], [], []
+    for line, (name, status, why, table, has_nat) in zip(entries, results):
         if status != 'ok':
             failed.append((name, status, why))
             continue
         shutil.move(os.path.join(work, name + '.dksh'), os.path.join(out, name + '.dksh'))
         index.append(line)
+        if has_nat:
+            shutil.move(os.path.join(work, name + '_nat.dksh'), os.path.join(out, name + '_nat.dksh'))
+            nat.append(name)
         textures.append(' '.join([name] + ['%d:%s:%d' % t for t in table]))
     open(os.path.join(out, 'index.txt'), 'w').write('\n'.join(index) + '\n')
     open(os.path.join(out, 'textures.txt'), 'w').write('\n'.join(textures) + '\n')
+    open(os.path.join(out, 'nat.txt'), 'w').write('\n'.join(nat) + '\n')  # §16.129: names with a _nat variant
     size = sum(os.path.getsize(os.path.join(out, f)) for f in os.listdir(out))
     print('deko3d package: %d of %d shaders, %.1f MB -> %s' % (len(index), len(entries), size / 1e6, out))
+    print('pixel shaders with a no-alpha-test variant: %d' % len(nat))
     for name, status, why in failed[:20]:
         print('  FAILED %s: %s: %s' % (name, status, why))
     if len(failed) > 20:
