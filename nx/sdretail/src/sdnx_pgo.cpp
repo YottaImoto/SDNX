@@ -110,9 +110,11 @@ void DumpNow(const std::filesystem::path& file, int number) {
 }
 
 // Started by a static constructor; the first dump (and the choice of the file) waits 2 minutes, when the SDK has set
-// the executable folder and the log.
+// the executable folder and the log. The std::thread object is leaked on purpose, never detached: devkitA64's
+// std::thread::detach() throws std::system_error (the first build of 16.188 ended in std::terminate at start-up),
+// and a joinable std::thread that is destroyed terminates too.
 const bool kStarted = [] {
-  std::thread([] {
+  new std::thread([] {
     std::filesystem::path file;
     for (int number = 1;; ++number) {
       std::this_thread::sleep_for(kPeriod);
@@ -120,7 +122,7 @@ const bool kStarted = [] {
       if (file.empty()) return;
       DumpNow(file, number);
     }
-  }).detach();
+  });
   return true;
 }();
 
