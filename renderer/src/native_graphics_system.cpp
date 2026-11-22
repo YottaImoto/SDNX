@@ -31,12 +31,52 @@ REXCVAR_DEFINE_INT32(sdnx_sharpen, -1, "GPU",
 REXCVAR_DEFINE_BOOL(sdnx_upload_cached, true, "GPU",
                     "deko3d: the upload ring (constants, texture data, vertices) in CPU-cached memory, cleaned from the "
                     "cache before each submit, instead of write-combined memory (SDNX 16.141)");
+REXCVAR_DEFINE_STRING(sdnx_skip_cycle,
+                      "ps_75b785e4bef74504+ps_815eea133da1cdfd,ps_a635fb6ecdee8391,ps_a7f9a6856e5ae036,ps_c9a5881ccfb7202e",
+                      "GPU", "Four-finger touch cycles through these groups (comma) of pixel shaders (plus) not drawn "
+                      "(SDNX 16.174)");
+REXCVAR_DEFINE_STRING(sdnx_skip_ps, "", "GPU",
+                      "Comma-separated parts of pixel shader names whose draws are not drawn (SDNX 16.173)");
+REXCVAR_DEFINE_BOOL(sdnx_hash_stable_long, true, "GPU",
+                    "Geometry cache: content unchanged for 600+ frames is checked every 8th frame (SDNX 16.182)");
+REXCVAR_DEFINE_BOOL(sdnx_texmemo_frames, true, "GPU",
+                    "Texture descriptor memo kept from frame to frame for ordinary textures (SDNX 16.182)");
+REXCVAR_DEFINE_BOOL(sdnx_sparse_constants, true, "GPU",
+                    "Shader constants: only the registers a shader reads are copied per draw (SDNX 16.181)");
+REXCVAR_DEFINE_BOOL(sdnx_tile_merge, true, "GPU",
+                    "The scene pass the Xbox 360 draws in two tiles is drawn once at full height (SDNX 16.172)");
+REXCVAR_DEFINE_BOOL(sdnx_prefetch_shaders, true, "GPU",
+                    "deko3d: the shader objects of a draw are prefetched at its start (SDNX 16.171)");
+REXCVAR_DEFINE_BOOL(sdnx_capture_touch, true, "GPU",
+                    "A three-finger touch logs the next frame and dumps its picture (SDNX 16.170)");
+REXCVAR_DEFINE_BOOL(sdnx_upload_zva, true, "GPU",
+                    "Constant uploads allocate cache lines with DC ZVA instead of reading them first (SDNX 16.169)");
+REXCVAR_DEFINE_BOOL(sdnx_shared_lean, true, "GPU",
+                    "Shared constant block kept between draws: only descriptor numbers cleared, pull info copied only when used (SDNX 16.169)");
+REXCVAR_DEFINE_BOOL(sdnx_texmemo_keep, true, "GPU",
+                    "Texture descriptor memo kept over resolves for ordinary textures (SDNX 16.168)");
+REXCVAR_DEFINE_BOOL(sdnx_hash_inline, true, "GPU",
+                    "Geometry hash table with the values inside the buckets: one cache miss per lookup instead of two (SDNX 16.166)");
+REXCVAR_DEFINE_BOOL(sdnx_depth_direct, true, "GPU",
+                    "deko3d: depth resolves copy the extracted depth and stencil straight into their images instead of through a buffer (SDNX 16.165)");
+REXCVAR_DEFINE_BOOL(sdnx_deko3d_queries, true, "GPU",
+                    "deko3d: occlusion queries counted by the GPU (samples passed). false = every query is answered as visible, as before 16.163 (sun flares and light coronas then show through walls)");
+REXCVAR_DEFINE_BOOL(sdnx_hash_single_lookup, true, "GPU",
+                    "Geometry cache: the entry found by the reuse check is filled directly, without a second table lookup (SDNX 16.162)");
+REXCVAR_DEFINE_BOOL(sdnx_hash_stable_skip, true, "GPU",
+                    "Geometry cache: ranges unchanged for 120+ frames are hashed every 4th frame instead of every frame (SDNX 16.162). Off if geometry flickers or shows stale shapes for a moment");
 REXCVAR_DEFINE_BOOL(sdnx_push_constants, false, "GPU",
                     "deko3d: shader constants in persistent blocks updated in the command stream with only the changed "
                     "registers, instead of a copy of the whole block per draw (SDNX 16.139; off since 16.140: slower, the game rewrites nearly every constant before each draw)");
 REXCVAR_DEFINE_BOOL(sdnx_zcull, true, "GPU",
                     "deko3d: hardware ZCULL (coarse rejection of hidden pixels before shading, also for shaders with "
                     "kill), invalidated after every depth/stencil write outside the 3D engine (SDNX 16.131)");
+REXCVAR_DEFINE_BOOL(sdnx_gpu_diagnostics, false, "GPU",
+                    "deko3d: enable periodic synchronous GPU profiling and scene probes");
+REXCVAR_DEFINE_BOOL(sdnx_fxaa_zero_signs, true, "GPU",
+                    "deko3d: specialize FXAA when both texture sign masks are zero");
+REXCVAR_DEFINE_BOOL(sdnx_depth_only_vs, true, "GPU",
+                    "deko3d: use the position-only vertex variant for the 5add depth pass");
 REXCVAR_DEFINE_BOOL(sdnx_early_z, true, "GPU",
                     "deko3d: bind the pixel shader variant without the alpha-test discard while the alpha test is off, "
                     "so hidden pixels are rejected before shading (SDNX 16.129)");

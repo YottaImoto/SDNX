@@ -7,6 +7,7 @@ This repository contains or builds against the following projects.
 | [XenosRecomp](https://github.com/hedge-dev/XenosRecomp) (hedge-dev), with this port's changes | `nx/shaders/XenosRecomp` | MIT (`nx/shaders/LICENSE.md`) |
 | Shader tools from masseffect-nx's `shaders/` folder | `nx/shaders/tools` | MIT (`nx/shaders/LICENSE.md`) |
 | [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) and its Switch fork | not included; `renderer/` is a backend for it | BSD-3-Clause |
+| [Renut Ultimate Base](https://github.com/ChanseyIsTheBest/renut_nx_ultimate_base/tree/3f93050d7bec3dc25f204f841d522918a5f96e6b/sdk) SDK changes from sasrt-nx, blur-nx and TFU-nx via S4ep1-nx | event waits, handle table and semaphore notifications in the external SDK | BSD-3-Clause (upstream SDK notice) |
 | deko3d core from [rexglue-sdk-nx](https://github.com/nx-mod/rexglue-sdk-nx) (`src/ui/deko3d/nucleo.*`, Tom Clay, from nfsmw-nx) | `nx/deko3d` | BSD-3-Clause (`nx/deko3d/LICENSE.rexglue-sdk-nx`) |
 | [deko3d](https://github.com/devkitPro/deko3d), [uam](https://github.com/devkitPro/uam) | not included; Switch GPU library and its shader compiler | zlib / GPL-2.0+ (uam is a build tool only) |
 | [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | not included; SPIR-V to GLSL for uam | Apache-2.0 |

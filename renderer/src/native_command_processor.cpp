@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
+#include <sstream>
 #include <string>
 
 #include <rex/graphics/graphics_system.h>
@@ -36,6 +37,9 @@
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/string/buffer.h>
+#if REX_PLATFORM_SWITCH
+#include <switch.h>  // §16.170: the touch screen (three-finger capture)
+#endif
 
 
 namespace rex::graphics::sdnx {
@@ -318,6 +322,7 @@ NativeCommandProcessor::Image* NativeCommandProcessor::GetResolved(uint32_t addr
     return &image;
   }
   if (image.gpu) RetireImage(image);
+  ++resolved_layout_epoch_;  // §16.168
   EnsureFrame();
   EndRendering();
   if (!CreateImage(image, format, width, height, false)) {
@@ -550,6 +555,92 @@ bool NativeCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   return ok;
 }
 
+// §16.172: see TileMerge in the header.
+NativeCommandProcessor::TileRole NativeCommandProcessor::TileMergeClassify(const RegisterFile& regs) {
+  const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+  const auto window = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  const int32_t wo_x = window.window_x_offset, wo_y = window.window_y_offset;
+  if (surface.msaa_samples != xenos::MsaaSamples::k1X || wo_x != 0) {
+    tile_merge_.phase = 0;
+    return TileRole::kNone;
+  }
+  const uint32_t pitch = surface.surface_pitch;
+  const uint32_t depth_base = regs.Get<reg::RB_DEPTH_INFO>().depth_base;
+  const uint32_t color_base0 = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_base;
+  TileMerge& t = tile_merge_;
+  const bool same = t.known && pitch == t.pitch && depth_base == t.depth_base && color_base0 == t.color_base0;
+  if (wo_y < 0) {
+    draw_util::Scissor sc;
+    draw_util::GetScissor(regs, sc);
+    if (sc.offset[1] != 0 || !sc.extent[1]) {
+      t.phase = 0;
+      return TileRole::kNone;
+    }
+    if (!same || t.tile_h != sc.extent[1]) {
+      t = TileMerge();
+      t.known = true;
+      t.pitch = pitch;
+      t.depth_base = depth_base;
+      t.color_base0 = color_base0;
+      t.tile_h = sc.extent[1];
+      const uint32_t mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (!((mask >> (4 * i)) & 0xF)) continue;
+        t.color_bases[t.color_base_count++] =
+            regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_base;
+      }
+      REXGPU_INFO("[sdnx_tiles] tiled pass: color base {} depth base {} pitch {}, tile {} rows, window y {}",
+                  color_base0, depth_base, pitch, t.tile_h, wo_y);
+    }
+    t.full_h = std::max(t.full_h, uint32_t(-wo_y) + t.tile_h);
+    t.seen_frame = frame_;
+    if (t.expanded_frame == frame_) {
+      t.phase = 2;
+      t.tile_offset = uint32_t(-wo_y);
+      t.skipped_frame = frame_;
+      return TileRole::kSkip;
+    }
+    t.phase = 0;
+    return TileRole::kNone;
+  }
+  if (wo_y == 0 && same && t.seen_frame != UINT64_MAX && t.seen_frame != frame_ && frame_ - t.seen_frame <= 2 &&
+      t.skipped_frame != frame_) {
+    t.phase = 1;
+    t.expanded_frame = frame_;
+    return TileRole::kFirst;
+  }
+  t.phase = 0;
+  return TileRole::kNone;
+}
+
+// §16.174: inside the first tile of a merged pass every draw is drawn (that tile now covers the whole frame; a draw the
+// game predicated to the lower tile only would otherwise be lost with the skipped lower tile).
+bool NativeCommandProcessor::ForcePredicatedDraw() {
+  static const bool tile_merge = REXCVAR_GET(sdnx_tile_merge);
+  const TileMerge& t = tile_merge_;
+  if (!tile_merge || !t.known || t.seen_frame == UINT64_MAX || t.seen_frame == frame_ || frame_ - t.seen_frame > 2 ||
+      t.skipped_frame == frame_) {
+    return false;
+  }
+  const RegisterFile& regs = *register_file_;
+  const auto window = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  if (window.window_x_offset != 0 || window.window_y_offset != 0) return false;
+  const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+  return surface.msaa_samples == xenos::MsaaSamples::k1X && surface.surface_pitch == t.pitch &&
+         regs.Get<reg::RB_DEPTH_INFO>().depth_base == t.depth_base &&
+         regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_base == t.color_base0;
+}
+
+bool NativeCommandProcessor::TileMergeTarget(bool depth, uint32_t base, uint32_t pitch) const {
+  const TileMerge& t = tile_merge_;
+  if (!t.known || pitch != t.pitch) return false;
+  if (depth) return base == t.depth_base;
+  for (uint32_t i = 0; i < t.color_base_count; ++i) {
+    if (t.color_bases[i] == base) return true;
+  }
+  return false;
+}
+
 bool NativeCommandProcessor::IssueCopy() {
   ++stats_.copies;
   ++resolve_epoch_;
@@ -592,6 +683,21 @@ bool NativeCommandProcessor::IssueCopy() {
                   original_base, x0, y0, width, height, pitch, uint32_t(msaa), copy_depth);
     }
     ++res_count;
+  }
+  // §16.172: a resolve of a merged tiled pass. After the skipped later tile: its rows of the whole image. After the
+  // first tile (drawn whole): no clears yet - they would wipe the rows the later tiles' resolves still read.
+  bool tile_skip_clears = false;
+  {
+    static const bool tile_merge = REXCVAR_GET(sdnx_tile_merge);
+    if (tile_merge && surface.msaa_samples == xenos::MsaaSamples::k1X &&
+        TileMergeTarget(copy_depth, original_base, pitch)) {
+      if (tile_merge_.phase == 2) {
+        y0 += tile_merge_.tile_offset;
+        ++stats_.tile_resolves_moved;
+      } else if (tile_merge_.expanded_frame == frame_ && tile_merge_.skipped_frame != frame_) {
+        tile_skip_clears = true;
+      }
+    }
   }
   if (x0 + width > 4096 || y0 + height > 2048) {
     // Do not make an oversized target or blit from it: the guest resolves what fits its surface.
@@ -697,6 +803,12 @@ bool NativeCommandProcessor::IssueCopy() {
   }
 
   // Clears requested by the resolve.
+  if (tile_skip_clears) {  // §16.172
+    if (info.rb_copy_control.color_clear_enable || info.rb_copy_control.depth_clear_enable) {
+      ++stats_.tile_clears_skipped;
+    }
+    return true;
+  }
   auto copy_control = info.rb_copy_control;
   if (copy_control.color_clear_enable && !copy_depth) {
     Image* target = GetRenderTarget(info.color_original_base, pitch, uint32_t(info.color_edram_info.format), msaa,
@@ -761,6 +873,30 @@ void NativeCommandProcessor::ResolveDepth(const Image& source, const draw_util::
   if (!out_w || !out_h) return;
   src_w = out_w << sx;
   src_h = out_h << sy;
+  // §16.165: without MSAA the backend may copy the extracted depth and stencil straight into the images.
+  if (!sx && !sy) {
+    Image& stencil = resolved_stencil_[dest_base];
+    if (stencil.gpu && (stencil.width < dest->width || stencil.height < dest->height)) RetireImage(stencil);
+    if (!stencil.gpu && CreateImage(stencil, VK_FORMAT_R8_UNORM, dest->width, dest->height, false)) {
+      InitializeLayout(stencil);
+    }
+    ImageRegion from;
+    from.x = int32_t(src_x);
+    from.y = int32_t(src_y);
+    from.width = src_w;
+    from.height = src_h;
+    ImageRegion to = from;
+    to.x = int32_t(dx);
+    to.y = int32_t(dy);
+    EndRendering();
+    FullBarrier();
+    if (backend_->ExtractDepthStencilToImages(source.gpu, from, dest->gpu, to, stencil.gpu, to)) {
+      transfer_pending_ = true;  // see BeginPass: the next rendering pass needs a full barrier
+      FullBarrier();
+      if (log_frame_) backend_->DebugProbe(dest->gpu, to, dest_base, "depth");
+      return;
+    }
+  }
   VkDeviceSize offset = Upload(nullptr, VkDeviceSize(src_w) * src_h * 4, 16);
   if (offset == UINT64_MAX) return;
   GpuBuffer* buffer = upload_[uint32_t(frame_ % kFramesInFlight)].gpu;
@@ -964,7 +1100,7 @@ void NativeCommandProcessor::ReportStats() {
     }
     REXGPU_INFO("[sdnx_prof] per draw (us): state {:.2f} vertices {:.2f} (pairing {:.2f} pulled {:.2f} bindings {:.2f}) indices {:.2f} constants+textures {:.2f} "
                 "pipeline {:.2f} record {:.2f} | total {:.2f} us/draw, {:.2f} ms/frame in draws | hashed geometry: "
-                "hits {:.0f} (reused {:.0f}) fills {:.0f} ({:.2f} MB) /frame, entries {}, hashed {:.1f} MB/frame of bindings {:.1f} MB; hot refusals {:.0f}/frame, page age {:.0f} frames, strikes avg {:.1f} max {}; constants reused {:.0f}/frame, set binds skipped {:.0f}/frame, texture memo hits {:.0f}/frame, shader loads without hash {:.0f}/frame, full barriers {:.0f}/frame (attachment {:.0f}, none {:.0f}), textures evicted {}, textures {}",
+                "hits {:.0f} (reused {:.0f}) fills {:.0f} ({:.2f} MB) /frame, entries {}, hashed {:.1f} MB/frame of bindings {:.1f} MB; hot refusals {:.0f}/frame, page age {:.0f} frames, strikes avg {:.1f} max {}; constants reused {:.0f}/frame, set binds skipped {:.0f}/frame, texture memo hits {:.0f}/frame (kept over resolves {:.0f}, from earlier frames {:.0f}), shader loads without hash {:.0f}/frame, full barriers {:.0f}/frame (attachment {:.0f}, none {:.0f}), textures evicted {}, textures {}",
                 stats_.prof_ns[0] * to_us / d, stats_.prof_ns[1] * to_us / d, stats_.prof_sub[0] * to_us / d,
                 stats_.prof_sub[1] * to_us / d, stats_.prof_sub[2] * to_us / d, stats_.prof_ns[2] * to_us / d,
                 stats_.prof_ns[3] * to_us / d, stats_.prof_ns[4] * to_us / d, stats_.prof_ns[5] * to_us / d,
@@ -973,9 +1109,27 @@ void NativeCommandProcessor::ReportStats() {
                 stats_.hash_bytes / frames / 1048576.0, stats_.hash_whole_bytes / frames / 1048576.0, stats_.hot_checks / frames,
                 stats_.hot_checks ? double(stats_.hot_age) / stats_.hot_checks : 0.0,
                 stats_.hot_checks ? double(stats_.hot_strikes) / stats_.hot_checks : 0.0, stats_.hot_strikes_max,
-                stats_.constants_reused / frames, stats_.constants_bind_skipped / frames, stats_.tex_memo_hits / frames,
+                stats_.constants_reused / frames, stats_.constants_bind_skipped / frames, stats_.tex_memo_hits / frames, stats_.tex_memo_kept / frames, stats_.tex_memo_carried / frames,
                 stats_.shader_load_hits / frames, stats_.full_barriers / frames, stats_.attachment_barriers / frames,
                 stats_.pass_barriers_skipped / frames, stats_.textures_evicted, textures_.size());
+  }
+  if (frames > 0) {  // §16.172
+    const uint64_t predicated = predicated_draws_skipped_;
+    REXGPU_INFO("[sdnx_tiles] per frame: first-tile draws drawn whole {:.0f}, later-tile draws skipped {:.0f}, "
+                "resolves moved {:.0f}, clears deferred {:.0f}; draws dropped by the bin predicate {:.0f}, drawn "
+                "anyway in the whole first tile {:.0f}",
+                stats_.tile_expanded / frames, stats_.tile_skipped / frames, stats_.tile_resolves_moved / frames,
+                stats_.tile_clears_skipped / frames, double(predicated - predicated_reported_) / frames,
+                double(predicated_draws_forced_ - forced_reported_) / frames);
+    predicated_reported_ = predicated;
+    forced_reported_ = predicated_draws_forced_;
+  }
+  if (frames > 0) {  // §16.171
+    REXGPU_INFO("[sdnx_const] per frame: VS {:.0f} uploads {:.0f} KB, PS {:.0f} uploads {:.0f} KB, shared {:.0f} uploads "
+                "{:.0f} KB; not copied (unread registers, 16.181) {:.0f} KB", stats_.const_uploads[0] / frames,
+                stats_.const_bytes[0] / frames / 1024.0, stats_.const_uploads[1] / frames,
+                stats_.const_bytes[1] / frames / 1024.0, stats_.const_uploads[2] / frames,
+                stats_.const_bytes[2] / frames / 1024.0, stats_.const_sparse_saved / frames / 1024.0);
   }
   if (!barrier_sites_.empty()) {
     std::vector<std::pair<uint64_t, std::string>> sites;
@@ -1199,6 +1353,12 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       REXGPU_INFO("[sdnx_cpu] {:.1f} ms/frame: waiting for the game {:.1f}, draws {:.1f} ({} a frame, {:.1f} us each), "
                   "resolves {:.1f}, other {:.1f}; GPU fence waits {:.1f} (inside the above)",
                   wall, idle, draw, cpu_window_draws_ / 30, per_draw, copy, wall - idle - draw - copy, gw);
+      REXGPU_INFO("[sdnx_query] 30 frames: {} queries ended, {} answered visible ({} without a count yet); draws inside "
+                  "them {}: no depth attachment {}, depth test off {}, ZFUNC always {}, outside a pass {}",
+                  qdiag_queries_, qdiag_visible_, qdiag_first_, qdiag_draws_, qdiag_no_depth_, qdiag_no_ztest_,
+                  qdiag_always_, qdiag_no_pass_);
+      qdiag_draws_ = qdiag_no_depth_ = qdiag_no_ztest_ = qdiag_always_ = qdiag_no_pass_ = 0;
+      qdiag_queries_ = qdiag_visible_ = qdiag_first_ = 0;
       cpu_window_start_ns_ = now;
       cpu_gpu_wait_base_ns_ = backend_->CpuWaitNs();
       cpu_idle_ns_ = cpu_draw_ns_ = cpu_copy_ns_ = cpu_window_draws_ = 0;
@@ -1236,6 +1396,67 @@ void NativeCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       dump_at_done = true;
       dump_remaining_ = 1;
     }
+#if REX_PLATFORM_SWITCH
+    // §16.170: a touch with three fingers or more logs the next frame (every draw: shaders, blending, textures,
+    // targets) and writes its picture to front_dump.ppm - to catch an effect at the moment it is on screen. Once per
+    // touch, at most 5 times a run.
+    {
+      static const bool capture_touch = REXCVAR_GET(sdnx_capture_touch);
+      static bool capture_armed = true;
+      static uint32_t captures = 0;
+      HidTouchScreenState touch{};
+      const bool touched = capture_touch && hidGetTouchScreenStates(&touch, 1) != 0;
+      // §16.175: exactly three fingers held for 8 swaps, with no fourth finger during this touch (fingers land one
+      // by one: a four-finger touch passed through three and captured as well).
+      static uint32_t three_swaps = 0;
+      static bool four_seen = false;
+      if (touched && touch.count >= 4) four_seen = true;
+      if (!touched || touch.count == 0) four_seen = false;
+      three_swaps = touched && touch.count == 3 ? three_swaps + 1 : 0;
+      const bool three = three_swaps >= 8 && !four_seen;
+      // §16.174: four fingers - the next group of sdnx_skip_cycle (once per touch).
+      {
+        static bool cycle_armed = true;
+        static const bool parsed = [this] {
+          std::stringstream groups(REXCVAR_GET(sdnx_skip_cycle));
+          for (std::string group; std::getline(groups, group, ',');) {
+            std::vector<std::string> parts;
+            std::stringstream members(group);
+            for (std::string part; std::getline(members, part, '+');) {
+              while (!part.empty() && part.front() == ' ') part.erase(part.begin());
+              while (!part.empty() && part.back() == ' ') part.pop_back();
+              if (!part.empty()) parts.push_back(part);
+            }
+            if (!parts.empty()) skip_cycle_groups_.push_back(parts);
+          }
+          return true;
+        }();
+        (void)parsed;
+        const bool four = touched && touch.count >= 4;
+        if (four && cycle_armed && !skip_cycle_groups_.empty()) {
+          cycle_armed = false;
+          skip_cycle_ = (skip_cycle_ + 1) % uint32_t(skip_cycle_groups_.size() + 1);
+          std::string names;
+          if (skip_cycle_) {
+            for (const std::string& part : skip_cycle_groups_[skip_cycle_ - 1]) names += part + " ";
+          }
+          REXGPU_INFO("[sdnx_skip] four-finger touch: step {} of {}, not drawn: {}", skip_cycle_,
+                      skip_cycle_groups_.size(), skip_cycle_ ? names : std::string("(nothing)"));
+        }
+        if (!touched || touch.count < 4) cycle_armed = true;
+      }
+      if (three && capture_armed && captures < 5) {
+        capture_armed = false;
+        ++captures;
+        log_frame_ = true;
+        if (!dump_pending_) dump_remaining_ = 1;
+        backend_->ArmPixelHistory();  // §16.175
+        REXGPU_INFO("[sdnx_capture] three-finger touch #{}: frame log of swap {} and front_dump.ppm", captures,
+                    swap_count_);
+      }
+      if (!three) capture_armed = true;
+    }
+#endif
     log_draw_ = 0;
     if (log_frame_) REXGPU_INFO("[sdnx_frame] ---- swap {} ----", swap_count_);
   }

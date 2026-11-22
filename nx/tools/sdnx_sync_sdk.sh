@@ -28,6 +28,7 @@ for d in src/graphics/sdnx include/rex/graphics/sdnx; do
 done
 copyfile "$SRC/src/graphics/CMakeLists.txt" "$DST/src/graphics/CMakeLists.txt"
 copyfile "$SRC/src/graphics/plugin_main.cpp" "$DST/src/graphics/plugin_main.cpp"
+copyfile "$SRC/src/graphics/util/draw.cpp" "$DST/src/graphics/util/draw.cpp"
 copyfile "$SRC/include/rex/ui/vulkan/functions/device_1_0.inc" "$DST/include/rex/ui/vulkan/functions/device_1_0.inc"
 # deko3d core for the Switch backend.
 for d in include src; do

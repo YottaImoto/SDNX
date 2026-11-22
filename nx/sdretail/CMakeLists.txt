@@ -28,6 +28,7 @@ set(SDRETAIL_SOURCES
     src/sdnx_verify_data.cpp
     src/sdnx_perf_hooks.cpp
     src/sdnx_memset.cpp
+    src/sdnx_pgo.cpp
 )
 
 add_executable(sdretail ${SDRETAIL_SOURCES})
@@ -70,8 +71,59 @@ set_source_files_properties(
 
 if(REXGLUE_PLATFORM_SWITCH)
     set(SDRETAIL_VERSION "0.1.0" CACHE STRING "NRO display version")
+    # icon.jpg: a 256x256 JPEG made from icon_horizon.png (repository root). It is the game's cover art, so it is not
+    # in the repository (.gitignore): without it the NRO gets libnx's default icon.
+    set(_sdretail_icon)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/icon.jpg")
+        set(_sdretail_icon ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.jpg")
+    endif()
     rexglue_switch_add_nro(sdretail
         NAME "Sleeping Dogs"
         AUTHOR "SDNX"
-        VERSION "${SDRETAIL_VERSION}")
+        VERSION "${SDRETAIL_VERSION}"
+        ${_sdretail_icon})
+endif()
+
+# SDNX 16.188: profile-guided optimisation (renut_nx_ultimate_base's method, docs/building.md section 4; on SASRT
+# PGO + LTO took the render thread 30.9 -> 24.6 ms and the game thread 29.8 -> 24.6 ms, +9 % fps). Driving here is
+# CPU-bound (285 % of the 300 % the process has, 16.184), ~200 % of it in the game's own code.
+#   SDNX_PGO=generate: an instrumented NRO (game code + app) that streams its branch counts to <NRO folder>/pgo/
+#     (src/sdnx_pgo.cpp; registered in a section, not by constructors). Counters without atomics (lost increments
+#     are smoothed by -fprofile-correction at the use step), no value profiles (devkitA64's libgcov is not safe
+#     with them: blur-nx).
+#   SDNX_PGO=use: the counts merged by nx/tools/sd_pgo_merge.sh from SDNX_PGO_DIR. Code the session did not run is
+#     compiled as without a profile (-fprofile-partial-training); functions changed since keep none
+#     (-Wno-coverage-mismatch). The game code's inliner limits from sa2-nx (max-inline-insns-auto 64,
+#     inline-unit-growth 12).
+# -fprofile-prefix-path makes the .gcda names relative to the build folder, so the two builds may use different ones.
+# The SDK libraries stay out (they share one output folder between build trees).
+set(SDNX_PGO "" CACHE STRING "Profile-guided optimisation: empty, generate or use")
+set(SDNX_PGO_DIR "$ENV{HOME}/masseffect-nx/pgo" CACHE PATH "Folder of the PGO profile (.gcda files)")
+if(SDNX_PGO)
+    if(SDNX_PGO STREQUAL "generate")
+        set(_sdnx_pgo "-fprofile-generate=${SDNX_PGO_DIR}" "-fprofile-prefix-path=${CMAKE_BINARY_DIR}"
+                      -fno-profile-values -fprofile-update=single -fprofile-info-section=gcov_info)
+        target_compile_definitions(sdretail PRIVATE SDNX_PGO_GENERATE=1)
+    elseif(SDNX_PGO STREQUAL "use")
+        file(GLOB_RECURSE _sdnx_pgo_gcda "${SDNX_PGO_DIR}/*.gcda")
+        if(NOT _sdnx_pgo_gcda)
+            message(FATAL_ERROR "SDNX_PGO=use: no .gcda in ${SDNX_PGO_DIR} (nx/tools/sd_pgo_merge.sh first)")
+        endif()
+        set(_sdnx_pgo "-fprofile-use=${SDNX_PGO_DIR}" "-fprofile-prefix-path=${CMAKE_BINARY_DIR}"
+                      -fprofile-correction -fno-profile-values -fprofile-partial-training -Wno-missing-profile
+                      -Wno-coverage-mismatch)
+        if(TARGET sdretail_recomp)
+            target_compile_options(sdretail_recomp PRIVATE --param=max-inline-insns-auto=64
+                                   --param=inline-unit-growth=12)
+        endif()
+    else()
+        message(FATAL_ERROR "SDNX_PGO must be empty, generate or use (got ${SDNX_PGO})")
+    endif()
+    foreach(_target sdretail sdretail_recomp)
+        if(TARGET ${_target})
+            target_compile_options(${_target} PRIVATE ${_sdnx_pgo})
+        endif()
+    endforeach()
+    target_link_options(sdretail PRIVATE ${_sdnx_pgo})
+    message(STATUS "SDNX: PGO ${SDNX_PGO} (${SDNX_PGO_DIR})")
 endif()

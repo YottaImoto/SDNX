@@ -23,7 +23,7 @@ REXGLUE="${REXGLUE:-$ME/sdk/out/host/rexglue}"
 
 echo "== sync sources $SRC -> $APP"
 mkdir -p "$APP/src"
-for f in CMakeLists.txt sdretail_manifest.toml overrides.toml perf_overrides.toml sdretail.toml; do
+for f in CMakeLists.txt sdretail_manifest.toml overrides.toml perf_overrides.toml sdretail.toml icon.jpg; do
   sed 's/\r$//' "$SRC/$f" > "$APP/$f"
 done
 for f in "$SRC"/src/*; do sed 's/\r$//' "$f" > "$APP/src/$(basename "$f")"; done

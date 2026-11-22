@@ -41,9 +41,28 @@ REXCVAR_DECLARE(bool, sdnx_deko3d_breadcrumb);
 // SDNX §16.123: the deko3d backend's internal render scale (percent; 100, 75, 50).
 REXCVAR_DECLARE(int32_t, sdnx_render_scale);
 REXCVAR_DECLARE(bool, sdnx_early_z);
+REXCVAR_DECLARE(bool, sdnx_depth_only_vs);
+REXCVAR_DECLARE(bool, sdnx_fxaa_zero_signs);
+REXCVAR_DECLARE(bool, sdnx_gpu_diagnostics);
 REXCVAR_DECLARE(bool, sdnx_zcull);
 REXCVAR_DECLARE(bool, sdnx_push_constants);
 REXCVAR_DECLARE(bool, sdnx_upload_cached);
+REXCVAR_DECLARE(bool, sdnx_hash_single_lookup);  // §16.162
+REXCVAR_DECLARE(bool, sdnx_deko3d_queries);      // §16.163
+REXCVAR_DECLARE(bool, sdnx_depth_direct);        // §16.165
+REXCVAR_DECLARE(bool, sdnx_hash_inline);         // §16.166
+REXCVAR_DECLARE(bool, sdnx_texmemo_keep);        // §16.168
+REXCVAR_DECLARE(bool, sdnx_upload_zva);          // §16.169
+REXCVAR_DECLARE(bool, sdnx_shared_lean);         // §16.169
+REXCVAR_DECLARE(bool, sdnx_capture_touch);       // §16.170
+REXCVAR_DECLARE(bool, sdnx_prefetch_shaders);    // §16.171
+REXCVAR_DECLARE(bool, sdnx_tile_merge);          // §16.172
+REXCVAR_DECLARE(bool, sdnx_sparse_constants);    // §16.181
+REXCVAR_DECLARE(bool, sdnx_texmemo_frames);      // §16.182
+REXCVAR_DECLARE(bool, sdnx_hash_stable_long);    // §16.182
+REXCVAR_DECLARE(std::string, sdnx_skip_ps);      // §16.173
+REXCVAR_DECLARE(std::string, sdnx_skip_cycle);   // §16.174
+REXCVAR_DECLARE(bool, sdnx_hash_stable_skip);    // §16.162
 REXCVAR_DECLARE(int32_t, sdnx_sharpen);
 REXCVAR_DECLARE(int32_t, sdnx_submits_in_flight);
 

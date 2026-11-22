@@ -27,6 +27,7 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/sdnx/native_graphics_system.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
@@ -680,6 +681,7 @@ bool NativeCommandProcessor::LoadTexture(Texture& texture, const xenos::xe_gpu_t
   texture.content_hash = content_hash;
   texture.validated_frame = frame_;
   texture.loaded = true;
+  ++texture.generation;  // §16.182
   ++stats_.tex_loads;
   stats_.tex_bytes += total;
   return true;
@@ -761,6 +763,8 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
   uint32_t swizzle = fetch.swizzle;
   uint32_t index = 0, host_swizzle = kSwizzleRGBA;
   bool signed_view = false;
+  last_descriptor_strict_ = true;  // §16.168: cleared below for an ordinary 2D / 3D texture
+  last_texture_ = nullptr;          // §16.182
 
   // Render to texture: the resolved image of that address.
   auto resolved = heap == 0 ? resolved_.find(base_page << kPageSizeLog2) : resolved_.end();
@@ -882,6 +886,8 @@ uint32_t NativeCommandProcessor::GetTextureDescriptor(uint32_t fetch_constant, u
       }
     }
     if (texture.failed) return 0;
+    last_descriptor_strict_ = heap == 2;  // §16.168: cube faces may be overlaid from resolves
+    last_texture_ = &texture;             // §16.182
     if (!texture.loaded) {
       if (!LoadTexture(texture, fetch)) return 0;
     } else if (texture.validated_frame != frame_) {
@@ -969,12 +975,24 @@ void NativeCommandProcessor::BindTextures(Shader* vs, Shader* ps, uint32_t* shar
   // images, resolved copies, the R/B swap, the texture, its view, the sampler) - ~7 % of the GPU thread on the
   // console. Valid within one frame and until the next resolve (a resolve may replace the image behind an address);
   // a texture is revalidated against its guest pages at its first use in a frame, which is a memo miss.
+  // §16.168: a resolve (~tens a frame) reset the whole memo, though it only changes the descriptors of resolved
+  // images (and of cubes with resolved faces); an ordinary texture's descriptor changes only when a resolved image
+  // appears or is replaced (it could now sit at that texture's address). Those entries are kept over resolves.
+  // §16.182: an ordinary texture's entry is also kept from frame to frame (up to 120 frames: textures are evicted
+  // only after 600 unused): it names the Texture and its load generation, and at its first use in a frame the
+  // texture's page version is checked, as GetTextureDescriptor does. When driving, ~1000+ textures a frame were
+  // looked up again every frame (the texture path was ~15 % of this thread).
   struct Memo {
-    uint64_t key = 0, frame = UINT64_MAX, epoch = 0;
+    uint64_t key = 0, frame = UINT64_MAX, epoch = 0, layout_epoch = 0;
     uint32_t index = 0, heap = 0, sampler = 0;
+    bool strict = true;
     float inv_size[2] = {1.0f, 1.0f};
+    Texture* tex = nullptr;
+    uint64_t tex_gen = 0;
   };
-  static Memo memo[1024];
+  static const bool keep_over_resolves = REXCVAR_GET(sdnx_texmemo_keep);
+  static const bool keep_over_frames = REXCVAR_GET(sdnx_texmemo_frames);
+  static Memo memo[4096];
   static const bool no_memo = std::getenv("SDNX_NO_TEXMEMO") != nullptr;  // A/B measurements
   uint32_t done = 0;
   for (Shader* shader : {vs, ps}) {
@@ -996,9 +1014,29 @@ void NativeCommandProcessor::BindTextures(Shader* vs, Shader* ps, uint32_t* shar
       key_data.filters = uint32_t(attr.mag_filter) | uint32_t(attr.min_filter) << 8 | uint32_t(attr.mip_filter) << 16;
       key_data.lod_bias = attr.lod_bias;
       const uint64_t key = XXH3_64bits(&key_data, sizeof(key_data));
-      Memo& m = memo[key & 1023];
-      if (!no_memo && m.key == key && m.frame == frame_ && m.epoch == resolve_epoch_) {
+      Memo& m = memo[key & 4095];
+      const bool same = !no_memo && m.key == key && m.frame == frame_;
+      bool carried = false;
+      if (!same && keep_over_frames && !no_memo && m.key == key && !m.strict && m.tex && m.frame != UINT64_MAX &&
+          frame_ - m.frame <= 120 && m.layout_epoch == resolved_layout_epoch_ && m.tex->loaded &&
+          m.tex->generation == m.tex_gen) {
+        if (m.tex->validated_frame == frame_) {
+          carried = true;
+        } else if (TexturePagesVersion(*m.tex) == m.tex->version) {
+          m.tex->validated_frame = frame_;  // what GetTextureDescriptor's check would conclude
+          carried = true;
+        }
+      }
+      if (carried) {
+        m.frame = frame_;
+        m.epoch = resolve_epoch_;
         ++stats_.tex_memo_hits;
+        ++stats_.tex_memo_carried;
+      } else if (same && m.epoch == resolve_epoch_) {
+        ++stats_.tex_memo_hits;
+      } else if (same && keep_over_resolves && !m.strict && m.layout_epoch == resolved_layout_epoch_) {
+        ++stats_.tex_memo_hits;
+        ++stats_.tex_memo_kept;
       } else {
         uint32_t heap = 0;
         float inv_size[2] = {1.0f, 1.0f};
@@ -1009,6 +1047,10 @@ void NativeCommandProcessor::BindTextures(Shader* vs, Shader* ps, uint32_t* shar
         m.key = key;
         m.frame = frame_;
         m.epoch = resolve_epoch_;
+        m.layout_epoch = resolved_layout_epoch_;
+        m.strict = last_descriptor_strict_ || !index;
+        m.tex = m.strict ? nullptr : last_texture_;
+        m.tex_gen = m.tex ? m.tex->generation : 0;
         m.index = index;
         m.heap = heap;
         m.sampler = sampler;

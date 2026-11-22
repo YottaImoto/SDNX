@@ -4,20 +4,26 @@
 Works on the user's own extracted game data (the game_root folder). Changes:
   * localisation tables (all 7 languages): the strings listed in port/branding/switch_text.json;
   * UI textures BUTTON_* (perm 0x14B0D2FB + temp 0xFBEDD2FF): Switch-style glyphs from make_switch_buttons.py;
-  * Settings > Display movie (0xEBCA65F0): an "FPS LIMITER" row 30 / 60 / OFF (fps_menu_patch.py), read by the NRO.
+  * Settings > Display movie (0xEBCA65F0): an "FPS LIMITER" row 30 / 60 / OFF (fps_menu_patch.py), read by the NRO;
+  * controls layout screen: the Switch drawn in the game's style instead of the Xbox 360 pad (texture CONTROLLER,
+    make_switch_controller.py, with the contour of the game's own SD_LOGO on the screen) and the callout lines and
+    labels moved to its buttons (movie 0x6CBBBDB6, controls_screen_patch.py); the Map / camera labels name the touch
+    controls (strings in switch_text.json).
 
 How an archive is patched: each changed entry is written uncompressed at the end of NAME.big (4 KB aligned) and
 its NAME.bix record is pointed there (compressed_size = 0, as the game's own stored entries). The original bytes
 stay in place, so --restore only truncates the .big and puts back the saved .bix.
 
 Usage:
-  apply_branding.py GAME_ROOT [--by-letter] [--no-text] [--no-buttons] [--no-fps-menu]
+  apply_branding.py GAME_ROOT [--by-letter] [--swap-xy] [--no-text] [--no-buttons] [--no-fps-menu]
+                    [--no-controls-screen]
   apply_branding.py GAME_ROOT --restore
   apply_branding.py GAME_ROOT --verify OUT_DIR      (decode patched glyphs + changed strings for review)
 
 Face buttons are labelled by position by default (Xbox A = bottom = Switch B, B -> A, X -> Y, Y -> X), matching
 the NRO's default input mapping (input_xbox_layout = true). --by-letter: labels A/B/X/Y as on the Xbox, for
-input_xbox_layout = false.
+input_xbox_layout = false. --swap-xy: the X and Y glyphs swap places, for input_swap_xy = true (the NRO default
+since 16.159; with --by-letter the left button Y does the Xbox X action and the top button X the Xbox Y action).
 """
 import json
 import os
@@ -30,6 +36,7 @@ sys.path.insert(0, HERE)
 
 import numpy as np  # noqa: E402
 
+import controls_screen_patch  # noqa: E402
 import fps_menu_patch  # noqa: E402
 import sdbig  # noqa: E402
 import sdtex  # noqa: E402
@@ -42,6 +49,7 @@ BUTTONS_TEMP = 0xFBEDD2FF
 TEXT_JSON = os.path.join(HERE, "..", "branding", "switch_text.json")
 STATE_SUFFIX = ".sdnx_branding.json"
 ALIGN = 0x1000
+LOGO_PERM, LOGO_TEMP = 0x206F6405, 0xCF326401  # SD_LOGO (DXT5 512x512), source of the contour on the drawn screen
 
 
 def load_text_table():
@@ -140,7 +148,23 @@ def append_entries(bi: sdbig.BigIndex, new_data: dict):
     bi.save_bix()
 
 
-def patch_archive(base, table, glyphs, fps_menu=True):
+def _decode_texture(perm: bytes, temp: bytes, name: str):
+    for t in sdtex.iter_textures(perm):
+        if t["name"] == name and sdtex.FORMATS.get(t["fmt"]) == "DXT5":
+            raw = xtex.swap16(temp[t["pos"]:t["pos"] + t["size"]])
+            return xtex.decode_dxt(xtex.untile_blocks(raw, t["w"] // 4, t["h"] // 4, 16), t["w"], t["h"], "DXT5")
+    return None
+
+
+def patch_controller(perm: bytes, temp: bytes, logo) -> bytes:
+    """The CONTROLLER texture (DXT5 512x256) replaced by the Switch drawing."""
+    import make_switch_controller
+    from PIL import Image
+    img = make_switch_controller.draw(Image.fromarray(logo, "RGBA") if logo is not None else None)
+    return patch_buttons(perm, temp, {"CONTROLLER": img})[0]
+
+
+def patch_archive(base, table, glyphs, fps_menu=True, controls=True):
     restore(base, quiet=True)
     bi = sdbig.BigIndex(base)
     big_size = os.path.getsize(bi.big_path)
@@ -160,6 +184,18 @@ def patch_archive(base, table, glyphs, fps_menu=True):
             temp = bi.read(bi.by_uid[BUTTONS_TEMP], f)
             nt, btn = patch_buttons(perm, temp, glyphs)
             new_data[BUTTONS_TEMP] = nt
+        ctl = False
+        if controls and controls_screen_patch.ENTRY_UID in bi.by_uid and                 controls_screen_patch.TEXTURE_PERM in bi.by_uid and controls_screen_patch.TEXTURE_TEMP in bi.by_uid:
+            logo = None
+            if LOGO_PERM in bi.by_uid and LOGO_TEMP in bi.by_uid:
+                logo = _decode_texture(bi.read(bi.by_uid[LOGO_PERM], f), bi.read(bi.by_uid[LOGO_TEMP], f), "SD_LOGO")
+            perm = bi.read(bi.by_uid[controls_screen_patch.TEXTURE_PERM], f)
+            temp = bi.read(bi.by_uid[controls_screen_patch.TEXTURE_TEMP], f)
+            new_data[controls_screen_patch.TEXTURE_TEMP] = patch_controller(perm, temp, logo)
+            d = bi.read(bi.by_uid[controls_screen_patch.ENTRY_UID], f)
+            if not controls_screen_patch.is_patched(d):
+                new_data[controls_screen_patch.ENTRY_UID] = controls_screen_patch.patch_entry(d)
+            ctl = True
         fps = False
         if fps_menu and fps_menu_patch.ENTRY_UID in bi.by_uid:
             d = bi.read(bi.by_uid[fps_menu_patch.ENTRY_UID], f)
@@ -174,8 +210,9 @@ def patch_archive(base, table, glyphs, fps_menu=True):
               open(state_path(bi), "w"), indent=1)
     append_entries(bi, new_data)
     langs = sorted({n.split("_", 1)[0] for n, _ in text_changes})
-    print("  %s: %d strings (%s), %d glyphs, fps menu %s, %d entries rewritten, +%d KB" % (
-        os.path.basename(base), len(text_changes), ", ".join(langs), len(btn), "yes" if fps else "no", len(new_data),
+    print("  %s: %d strings (%s), %d glyphs, fps menu %s, controls screen %s, %d entries rewritten, +%d KB" % (
+        os.path.basename(base), len(text_changes), ", ".join(langs), len(btn), "yes" if fps else "no",
+        "yes" if ctl else "no", len(new_data),
         (os.path.getsize(bi.big_path) - big_size) // 1024))
 
 
@@ -232,11 +269,11 @@ def main(argv):
     glyphs = None
     if "--no-buttons" not in argv:
         import make_switch_buttons
-        glyphs = make_switch_buttons.build("--by-letter" in argv)
+        glyphs = make_switch_buttons.build("--by-letter" in argv, "--swap-xy" in argv)
     for arc in ARCHIVES:
         base = os.path.join(root, arc)
         if os.path.exists(base + ".bix"):
-            patch_archive(base, table, glyphs, "--no-fps-menu" not in argv)
+            patch_archive(base, table, glyphs, "--no-fps-menu" not in argv, "--no-controls-screen" not in argv)
     return 0
 
 

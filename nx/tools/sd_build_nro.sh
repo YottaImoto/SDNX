@@ -15,6 +15,10 @@ MESA=/mnt/d/CODE/SDNX/mesa-sdk
 # gameplay without that crash. One build tree per setting, so switching does not rebuild everything.
 GUEST_VOLATILE="${GUEST_VOLATILE:-ON}"
 if [[ "$GUEST_VOLATILE" == ON ]]; then NRO_OUT="${NRO_OUT:-out/nx-sd-vol}"; else NRO_OUT="${NRO_OUT:-out/nx-sd}"; fi
+# SDNX 16.188: SDNX_PGO=generate (instrumented NRO, streams counts to pgo/ next to the NRO) or use (the profile merged
+# by nx/tools/sd_pgo_merge.sh from ~/masseffect-nx/pgo); each in a build tree of its own.
+SDNX_PGO="${SDNX_PGO:-}"
+if [[ -n "$SDNX_PGO" ]]; then NRO_OUT="${NRO_OUT}-pgo${SDNX_PGO}"; fi
 JOBS="${JOBS:-4}"
 DEST=/mnt/d/CODE/SDNX/nx
 
@@ -30,13 +34,13 @@ docker_cmd() {
 echo "== build $NRO_OUT (-j$JOBS)"
 docker_cmd run --rm -v "$ME:$ME" -v "$MESA:$MESA:ro" -w "$ME" \
   -e ME="$ME" -e MESA="$MESA" -e NRO_OUT="$NRO_OUT" -e JOBS="$JOBS" -e GUEST_VOLATILE="$GUEST_VOLATILE" \
-  -e SDNX_DEKO3D_DEBUG="${SDNX_DEKO3D_DEBUG:-OFF}" \
+  -e SDNX_DEKO3D_DEBUG="${SDNX_DEKO3D_DEBUG:-OFF}"   -e SDNX_PGO="$SDNX_PGO" \
   devkitpro/devkita64:latest bash -euo pipefail -c '
     cmake -S sdretail -B "$NRO_OUT" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$ME/tools/switch/cmake/switch-devkitA64.cmake" \
       -DDEVKITPRO=/opt/devkitpro \
       -DSDRETAIL_GUEST_VOLATILE="$GUEST_VOLATILE" \
-      -DSDNX_DEKO3D_DEBUG="${SDNX_DEKO3D_DEBUG:-OFF}" \
+      -DSDNX_DEKO3D_DEBUG="${SDNX_DEKO3D_DEBUG:-OFF}"       -DSDNX_PGO="$SDNX_PGO" -DSDNX_PGO_DIR="$ME/pgo" \
       -DREXGLUE_SWITCH_NVK_SDK="$MESA/opt/devkitpro/portlibs/switch" > "$NRO_OUT.configure.log" 2>&1 \
       || { tail -40 "$NRO_OUT.configure.log"; exit 1; }
     cmake --build "$NRO_OUT" -j "$JOBS"
@@ -44,5 +48,8 @@ docker_cmd run --rm -v "$ME:$ME" -v "$MESA:$MESA:ro" -w "$ME" \
     /opt/devkitpro/devkitA64/bin/aarch64-none-elf-nm "$NRO_OUT/sdretail" | grep "^0000000000000000 T _start$" > /dev/null
     echo "OK: _start at 0"
   '
-cp -f "$ME/$NRO_OUT/sdretail.nro" "$DEST/sdretail.nro"
-ls -la "$DEST/sdretail.nro"
+if [[ -n "$SDNX_PGO" ]]; then
+  cp -f "$ME/$NRO_OUT/sdretail.nro" "$DEST/sdretail_pgo$SDNX_PGO.nro"; ls -la "$DEST/sdretail_pgo$SDNX_PGO.nro"
+else
+  cp -f "$ME/$NRO_OUT/sdretail.nro" "$DEST/sdretail.nro"; ls -la "$DEST/sdretail.nro"
+fi

@@ -230,6 +230,20 @@ class GpuBackend {
   // SDNX §16.139: persistent constant blocks (0: VS, 4096 bytes; 1: PS, 3584) updated in the command stream, in a
   // pipelined way (each later draw sees the new bytes, earlier ones the old). Only when supported.
   virtual bool PushConstantsSupported() const { return false; }
+  // SDNX §16.160: kUpload mappings are ordinary cached memory, so reading them back is cheap.
+  virtual bool UploadMemoryCached() const { return false; }
+  // SDNX §16.171: a hint at the start of a draw - the shaders' objects are read by Draw several microseconds later.
+  virtual void PrefetchShader(const GpuShader* shader) const { (void)shader; }
+  // SDNX §16.175: record the next frame's pixel history (a small copy of the colour target after every draw).
+  virtual void ArmPixelHistory() {}
+  // SDNX §16.165: the depth (into an R32F image) and the stencil (into an R8 image, may be null) of `from` of a
+  // depth/stencil image, without going through a buffer. false: not done, the caller takes the buffer path.
+  virtual bool ExtractDepthStencilToImages(GpuImage* source, const ImageRegion& from, GpuImage* depth_dest,
+                                           const ImageRegion& depth_to, GpuImage* stencil_dest,
+                                           const ImageRegion& stencil_to) {
+    (void)source; (void)from; (void)depth_dest; (void)depth_to; (void)stencil_dest; (void)stencil_to;
+    return false;
+  }
   // SDNX §16.142: the frontend wrote [begin, end) of a kUpload buffer's mapping (a backend whose upload buffers are
   // CPU-cached cleans that range from the cache before the GPU can read it).
   virtual void NoteUploadWritten(GpuBuffer* buffer, uint64_t begin, uint64_t end) {

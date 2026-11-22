@@ -11,7 +11,7 @@
 //   sub_822684B8 = MemoryPool::Allocate(r3 pool, r4 size, r5 name, r6 flags = align << 8 | 1, r7); the UI's
 //   UIGfxAllocator::Alloc (sub_8249B170) calls it with the Scaleform pool 0x82FC7858. It returns 0 when the pool has
 //   no room. Logged:
-//     * always: every failed request (pool, size, name, request number of that pool);
+//     * always: every failed nonzero request (pool, size, name, request number of that pool);
 //     * with sdretail_alloc_log = true: every request of at least 64 KB, and every 2000th request of each pool
 //       with the running count and bytes (cheap enough to compare a whole boot).
 
@@ -216,7 +216,9 @@ REX_HOOK_RAW(sub_822684B8) {
   static std::mutex mutex;
   static std::unordered_map<uint32_t, PoolStats> pools;
   const bool verbose = REXCVAR_GET(sdretail_alloc_log);
-  if (result && !verbose) return;
+  // The game often asks for zero bytes and receives null. Only trace those calls
+  // when collecting the full pool history, before taking the shared stats lock.
+  if (!verbose && (result || !size)) return;
   std::lock_guard<std::mutex> lock(mutex);
   PoolStats& stats = pools[pool];
   ++stats.requests;

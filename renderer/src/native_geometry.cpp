@@ -15,7 +15,9 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <tuple>
 
+#include <rex/graphics/sdnx/native_graphics_system.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/system/xmemory.h>
@@ -36,6 +38,7 @@ constexpr VkDeviceSize kHashedBufferSize = VkDeviceSize(64) << 20;
 constexpr VkDeviceSize kHashedBufferSize = VkDeviceSize(128) << 20;
 #endif
 constexpr uint64_t kHashedEvictFrames = 120;  // content-hashed copies unused for this long are dropped
+constexpr size_t kHashedHeadroom = 8192;      // §16.166: new keys a frame may add without the table growing
 
 VkDeviceSize AllocateFrom(std::map<VkDeviceSize, VkDeviceSize>& free_blocks, VkDeviceSize size) {
   size = (size + kGeometryAlignment - 1) & ~(kGeometryAlignment - 1);
@@ -113,6 +116,10 @@ bool NativeCommandProcessor::InitializeGeometry() {
     geometry_free_[0] = kGeometryBufferSize;
   }
   hashed_gpu_ = backend_->CreateBuffer(kHashedBufferSize, BufferUsage::kGeometry, &hashed_mapping_);
+  hashed_.set_inline(REXCVAR_GET(sdnx_hash_inline));  // §16.166
+  hashed_.Maintain(kHashedHeadroom);
+  REXGPU_INFO("[sdnx_native] geometry hash table: {}", hashed_.is_inline() ? "values in the buckets (16.166)"
+                                                                            : "values in chunks");
   hashed_free_.clear();
   if (hashed_gpu_ && hashed_mapping_) FreeTo(hashed_free_, 0, kHashedBufferSize);
   return true;
@@ -122,9 +129,23 @@ NativeCommandProcessor::HashedGeometry* NativeCommandProcessor::HashedCopy(uint6
                                                                            VkDeviceSize host_size, FillRef fill) {
   static const bool disabled = std::getenv("SDNX_NO_HASHCACHE") != nullptr;  // A/B measurements
   if (disabled || !hashed_mapping_ || !host_size || host_size > kHashedBufferSize / 8) return nullptr;
-  auto [entry_ptr, inserted] = hashed_.try_emplace(key);
+  // §16.162: HashedReuse has just looked this key up (and the table has not changed since): use that entry.
+  static const bool single_lookup = REXCVAR_GET(sdnx_hash_single_lookup);
+  HashedGeometry* entry_ptr;
+  bool inserted;
+  if (single_lookup && hashed_last_entry_ && hashed_last_key_ == key) {
+    entry_ptr = hashed_last_entry_;
+    inserted = false;
+  } else {
+    std::tie(entry_ptr, inserted) = hashed_.try_emplace(key);
+    if (!entry_ptr) {  // §16.166: the table is full until the next frame - the caller uploads directly
+      hashed_last_entry_ = nullptr;
+      return nullptr;
+    }
+  }
+  hashed_last_entry_ = nullptr;
   HashedGeometry& entry = *entry_ptr;
-  entry.last_used = frame_;
+  entry.last_used = uint32_t(frame_);
   if (!inserted && entry.offset != UINT64_MAX && entry.content == content && entry.size >= host_size) {
     ++stats_.hash_hits;
     entry.hashed_frame = frame_;
@@ -138,6 +159,7 @@ NativeCommandProcessor::HashedGeometry* NativeCommandProcessor::HashedCopy(uint6
   VkDeviceSize offset = AllocateFrom(hashed_free_, host_size);
   if (offset == UINT64_MAX) {
     hashed_.erase(key);
+    hashed_last_entry_ = nullptr;
     return nullptr;
   }
   fill(hashed_mapping_ + offset);
@@ -145,7 +167,7 @@ NativeCommandProcessor::HashedGeometry* NativeCommandProcessor::HashedCopy(uint6
   entry.content_since = frame_;
   entry.content = content;
   entry.offset = offset;
-  entry.size = host_size;
+  entry.size = uint32_t(host_size);
   ++stats_.hash_fills;
   stats_.hash_fill_bytes += host_size;
   return &entry;
@@ -158,13 +180,23 @@ NativeCommandProcessor::HashedGeometry* NativeCommandProcessor::HashedReuse(uint
   static const bool disabled = std::getenv("SDNX_NO_HASHREUSE") != nullptr;  // A/B measurements
   if (disabled) return nullptr;
   HashedGeometry* found = hashed_.find(key);
+  hashed_last_key_ = key;
+  hashed_last_entry_ = found;
   if (!found) return nullptr;
   HashedGeometry& entry = *found;
-  if (entry.offset == UINT64_MAX || entry.size < host_size || entry.hashed_frame != frame_ ||
+  // §16.162: content unchanged for 120+ frames is trusted for up to 3 frames after its last hash.
+  static const bool stable_skip = REXCVAR_GET(sdnx_hash_stable_skip);
+  // §16.182: content unchanged for 600+ frames (20 s) is hashed every 8th frame instead of every 4th.
+  static const bool stable_long = REXCVAR_GET(sdnx_hash_stable_long);
+  const uint64_t trust = stable_long && frame_ - entry.content_since >= 600 ? 8 : 4;
+  const bool fresh = entry.hashed_frame == frame_ ||
+                     (stable_skip && entry.hashed_frame != UINT64_MAX && frame_ - entry.hashed_frame < trust &&
+                      frame_ - entry.content_since >= 120);
+  if (entry.offset == UINT64_MAX || entry.size < host_size || !fresh ||
       frame_ - entry.content_since < kHashedStableFrames) {
     return nullptr;
   }
-  entry.last_used = frame_;
+  entry.last_used = uint32_t(frame_);
   ++stats_.hash_reuse;
   return &entry;
 }
@@ -176,6 +208,7 @@ void NativeCommandProcessor::ShutdownGeometry() {
   hashed_gpu_ = nullptr;
   hashed_mapping_ = nullptr;
   hashed_.clear();
+  hashed_last_entry_ = nullptr;  // §16.162
   hashed_free_.clear();
   for (auto& retired : hashed_retired_) retired.clear();
   geometry_.clear();
@@ -217,10 +250,19 @@ void NativeCommandProcessor::ReleaseRetiredGeometry(uint32_t slot) {
   geometry_retired_[slot].clear();
   for (const auto& region : hashed_retired_[slot]) FreeTo(hashed_free_, region.first, region.second);
   hashed_retired_[slot].clear();
+  // §16.166: no draw is recorded here, so the inline table may move its values (grow, clear tombstones).
+  hashed_.Maintain(kHashedHeadroom);
+  hashed_last_entry_ = nullptr;
   // Eviction (every 64 frames): ring-buffer addresses seen once and geometry no longer drawn.
   if (frame_ % 64) return;
+  if (hashed_.refused() != hashed_refused_logged_) {
+    REXGPU_INFO("[sdnx_native] geometry hash table full: {} new keys refused so far (uploaded directly)",
+                hashed_.refused());
+    hashed_refused_logged_ = hashed_.refused();
+  }
+  hashed_last_entry_ = nullptr;  // §16.162
   hashed_.erase_if([&](uint64_t, HashedGeometry& entry) {
-    if (frame_ - entry.last_used <= kHashedEvictFrames) return false;
+    if (uint32_t(uint32_t(frame_) - entry.last_used) <= kHashedEvictFrames) return false;
     if (entry.offset != UINT64_MAX) hashed_retired_[slot].push_back({entry.offset, entry.size});
     return true;
   });

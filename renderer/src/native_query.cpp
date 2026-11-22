@@ -97,6 +97,9 @@ bool NativeCommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuff
   // End: the guest gets the last known count of this address now.
   auto known = query_results_.find(address);
   uint32_t samples = known != query_results_.end() ? known->second : kFirstFrameSamples;
+  ++qdiag_queries_;  // §16.161
+  if (samples) ++qdiag_visible_;
+  if (known == query_results_.end()) ++qdiag_first_;
   counts->ZPass_A = samples;
   counts->Total_A = samples;
   if (guest_query_active_) {

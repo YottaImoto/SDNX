@@ -61,6 +61,8 @@ struct GpuShader {
   // §16.129: pixel shaders: the variant without the alpha-test discard (<name>_nat.dksh), bound while it is off.
   DkShader no_alpha{};
   bool has_no_alpha = false;
+  bool has_depth_variant = false;
+  std::unique_ptr<DkShader> fxaa_zero_signs, fxaa_no_alpha_zero_signs;
 };
 
 class Deko3dBackend final : public GpuBackend {
@@ -124,11 +126,12 @@ class Deko3dBackend final : public GpuBackend {
   void EndRendering() override;
   void ClearAttachmentRect(GpuImage* target, const VkRect2D& rect, const float rgba[4]) override;
 
-  bool BeginQuery(uint32_t slot, uint32_t index) override { return false; }  // TODO: dkCmdBufReportCounter
-  void EndQuery(uint32_t slot, uint32_t index) override {}
+  // §16.163: occlusion queries as two SamplesPassed reports (begin, end) per query; the count is end - begin.
+  bool BeginQuery(uint32_t slot, uint32_t index) override;
+  void EndQuery(uint32_t slot, uint32_t index) override;
   void ResetQueries(uint32_t slot, uint32_t count) override {}
-  void ResolveQueries(uint32_t slot, uint32_t count) override {}
-  const uint64_t* QueryResults(uint32_t slot) override { return nullptr; }
+  void ResolveQueries(uint32_t slot, uint32_t count) override;
+  const uint64_t* QueryResults(uint32_t slot) override;
 
   bool Present(uint32_t slot, GpuImage* front, uint32_t front_width, uint32_t front_height, uint32_t width,
                uint32_t height, bool is_8bpc) override;
@@ -215,6 +218,10 @@ class Deko3dBackend final : public GpuBackend {
   // §16.119: GPU profile of one frame in kProfEvery: a timestamp at the start of every backend operation; the time to
   // the next mark is charged to this mark's label (passes by target shape). Printed as [sdnx_prof] after the frame.
   static constexpr uint32_t kProfMarks = 4096, kProfEvery = 300;
+  // §16.163: occlusion query reports, kFramesInFlight x kMaxQueries x {begin, end} x 16 bytes; counts per slot.
+  DkMemBlock query_block_ = nullptr;
+  std::array<uint32_t, kFramesInFlight> query_count_{};
+  std::vector<uint64_t> query_results_;
   DkMemBlock prof_block_ = nullptr;
   DkMemBlock const_block_ = nullptr;  // §16.139
   uint64_t cleaned_reported_ = 0;     // §16.141
@@ -268,6 +275,32 @@ class Deko3dBackend final : public GpuBackend {
   bool probe_snapshot_valid_ = false;
   bool pass_has_depth_ = false;  // the open pass has a depth target (Vulkan ignores a depth test without one, deko3d does not)
   std::unordered_map<const GpuImage*, uint32_t> draws_since_clear_;  // per target: draws since its last clear
+  const GpuImage* draws_counter_target_ = nullptr;  // §16.169: draws_since_clear_ entry of the pass target
+  uint32_t* draws_counter_ = nullptr;
+  bool prefetch_shaders_ = true;  // §16.171: cvar sdnx_prefetch_shaders
+  // §16.175: pixel history of one frame - after every draw the pass's first colour target is shrunk by the 2D engine
+  // into a 48x27 RGBA8 image and copied to a readback block; after the frame: which grid cells each draw changed.
+  static constexpr uint32_t kHistW = 48, kHistH = 27, kHistMax = 2500;
+  bool history_pending_ = false, history_active_ = false, history_failed_ = false;
+  DkImage history_image_{};
+  DkImageView history_view_{};
+  DkMemBlock history_block_ = nullptr;
+  GpuImage* pass_color0_ = nullptr;
+  struct HistoryEntry {
+    uint64_t draw = 0, pass = 0;
+    std::string vs, ps;
+    const GpuImage* target = nullptr;
+    uint32_t w = 0, h = 0;
+    int format = 0;
+    uint32_t index_count = 0;
+  };
+  std::vector<HistoryEntry> history_;
+  bool EnsureHistory();
+  void RecordPixelHistory(const DrawPacket& packet);
+  void WritePixelHistory();
+ public:
+  void ArmPixelHistory() override { history_pending_ = true; }
+ private:
   uint32_t probe_scene_bpp_ = 4;
   GpuImage* probe_snapshot_last_ = nullptr;  // the scene after the LAST scene pass of the probe frame
   // Probe frame: what the textures of the final pass contain (§16.73). Descriptor -> the view written there.
@@ -343,6 +376,18 @@ class Deko3dBackend final : public GpuBackend {
   uint64_t CpuWaitNs() const override { return nucleo_ ? nucleo_->NsEsperandoValla() : 0; }
   // §16.139: the persistent VS / PS constant blocks (const_block_: VS at 0, PS at 4096).
   bool PushConstantsSupported() const override { return const_addr_ != 0; }
+  bool UploadMemoryCached() const override;  // §16.160
+  // §16.171: the GpuShader object (bound shader, flags, texture list) into the cache before Draw reads it - the first
+  // loads of packet.vs / packet.ps were cache misses (~6 % of Draw's samples, 16.169).
+  void PrefetchShader(const GpuShader* shader) const override {
+    if (!shader || !prefetch_shaders_) return;
+    const char* p = reinterpret_cast<const char*>(shader);
+    for (size_t o = 0; o < sizeof(GpuShader); o += 64) __builtin_prefetch(p + o);
+    if (!shader->textures.empty()) __builtin_prefetch(shader->textures.data());
+  }
+  bool ExtractDepthStencilToImages(GpuImage* source, const ImageRegion& from, GpuImage* depth_dest,
+                                   const ImageRegion& depth_to, GpuImage* stencil_dest,
+                                   const ImageRegion& stencil_to) override;  // §16.165
   void NoteUploadWritten(GpuBuffer* buffer, uint64_t begin, uint64_t end) override;
   // §16.142: cleans the written ranges of the cached upload buffers; before every submit.
   void FlushUploads();
@@ -350,6 +395,14 @@ class Deko3dBackend final : public GpuBackend {
 
  private:
   uint64_t nat_draws_ = 0;  // draws that used the variant (heartbeat)
+  DkShader depth_only_vs_{};
+  bool depth_only_vs_loaded_ = false;
+  uint32_t depth_only_draws_ = 0;  // since the last heartbeat
+  uint32_t fxaa_fast_draws_ = 0;
+  bool gpu_diagnostics_ = false;
+  uint64_t last_present_tick_ = 0;
+  std::array<float, 120> present_intervals_ms_{};
+  size_t present_interval_count_ = 0;
 
   // Draw state already recorded in the open command buffer (deko3d keeps it until it changes).
   struct BoundState {

@@ -51,6 +51,9 @@
 !/port/tools/make_internal_ps.py
 !/port/tools/make_internal_vs.py
 !/port/tools/make_switch_buttons.py
+!/port/tools/make_switch_controller.py
+!/port/tools/controls_screen_patch.py
+!/port/tools/swfshape.py
 !/port/tools/native_shot.ps1
 !/port/tools/prof_symbolize.py
 !/port/tools/sdbig.py
@@ -73,3 +76,10 @@ __pycache__/
 *.spv
 *.nro
 *.elf
+# The NRO icon is the game's cover art.
+/nx/sdretail/icon.jpg
+# Compiled game shaders, made by nx/deko3d/shaders/build_depth_variant.py and build_fxaa_variant.py.
+/renderer/src/deko3d_depth_variant.h
+/renderer/src/deko3d_fxaa_variant.h
+# Previews of the patched game screens.
+/docs/controls_screen_switch_*.png

@@ -9,10 +9,11 @@ Mapping of the game's texture names (Xbox meaning in brackets) to the Switch lab
     BUTTON_ACCEPT [A, bottom] -> B   BUTTON_BACK [B, right] -> A   BUTTON_BUTTON1 [X, left] -> Y
     BUTTON_BUTTON2 [Y, top] -> X
   --by-letter (input_xbox_layout = false): A -> A, B -> B, X -> X, Y -> Y
+  --swap-xy (input_swap_xy = true): the BUTTON1 and BUTTON2 glyphs swap (with --by-letter: X [left] -> Y, Y [top] -> X)
   always: L1 [LB] -> L, R1 [RB] -> R, L2 [LT] -> ZL, R2 [RT] -> ZR, SELECT [Back] -> -, START -> +,
           L1R1 -> L R, L2R2 -> ZL ZR.  Sticks, stick clicks and the D-pad keep the original pictures.
 
-Usage: make_switch_buttons.py out_dir [--by-letter]     (writes PNGs + a contact sheet)
+Usage: make_switch_buttons.py out_dir [--by-letter] [--swap-xy]     (writes PNGs + a contact sheet)
 """
 import math
 import os
@@ -156,10 +157,14 @@ def pair(labels, w, h, trigger):
 
 # ---------------------------------------------------------------------------- set
 
-def build(by_letter=False):
+def build(by_letter=False, swap_xy=False):
     face = {"BUTTON_ACCEPT": "B", "BUTTON_BACK": "A", "BUTTON_BUTTON1": "Y", "BUTTON_BUTTON2": "X"}
     if by_letter:
         face = {"BUTTON_ACCEPT": "A", "BUTTON_BACK": "B", "BUTTON_BUTTON1": "X", "BUTTON_BUTTON2": "Y"}
+    if swap_xy:
+        # --swap-xy (SDK input_swap_xy = true, the NRO default since 16.159): Switch Y does the Xbox X action and
+        # Switch X the Xbox Y action, so the two glyphs swap; A and B stay as they are.
+        face["BUTTON_BUTTON1"], face["BUTTON_BUTTON2"] = face["BUTTON_BUTTON2"], face["BUTTON_BUTTON1"]
     out = {}
     for name, lab in face.items():
         out[name] = round_button(lab)
@@ -183,7 +188,7 @@ def main():
         return 1
     outdir = sys.argv[1]
     os.makedirs(outdir, exist_ok=True)
-    imgs = build("--by-letter" in sys.argv)
+    imgs = build("--by-letter" in sys.argv, "--swap-xy" in sys.argv)
     for k, v in imgs.items():
         Image.fromarray(v, "RGBA").save(os.path.join(outdir, k + ".png"))
     cols, cell = 6, 136

@@ -153,6 +153,10 @@ class NativeCommandProcessor : public CommandProcessor {
   // SDNX §16.132: where this thread's time goes, printed every 30 swaps ([sdnx_cpu]).
   uint64_t cpu_wait_start_ns_ = 0, cpu_idle_ns_ = 0, cpu_draw_ns_ = 0, cpu_copy_ns_ = 0, cpu_window_start_ns_ = 0;
   uint64_t cpu_gpu_wait_base_ns_ = 0, cpu_window_draws_ = 0;
+  // §16.161: draws inside guest occlusion queries (lens flares, coronas), for the [sdnx_query] line every 30 swaps:
+  // without a depth attachment, with the depth test off, with ZFUNC ALWAYS; queries ended and answered as visible.
+  uint64_t qdiag_draws_ = 0, qdiag_no_depth_ = 0, qdiag_no_ztest_ = 0, qdiag_always_ = 0, qdiag_no_pass_ = 0;
+  uint64_t qdiag_queries_ = 0, qdiag_visible_ = 0, qdiag_first_ = 0;
   void LumaRecord(const Image& front);
   void LumaCheck(uint32_t slot);
   void AttachmentBarrier();
@@ -240,7 +244,9 @@ class NativeCommandProcessor : public CommandProcessor {
   LibraryEntry* FindPixelShader(Shader* shader);
   GpuShader* GetShader(LibraryEntry& entry);
   // Bytes in the frame's upload buffer; returns the offset or UINT64_MAX when full.
-  VkDeviceSize Upload(const void* data, VkDeviceSize size, VkDeviceSize alignment, uint8_t** mapping_out = nullptr);
+  // written: bytes the caller writes through mapping_out (only those are cleaned from a CPU-cached buffer; §16.160).
+  VkDeviceSize Upload(const void* data, VkDeviceSize size, VkDeviceSize alignment, uint8_t** mapping_out = nullptr,
+                      VkDeviceSize written = UINT64_MAX);
   void EndRendering();
   bool DrawNative(xenos::PrimitiveType prim_type, uint32_t index_count, IndexBufferInfo* index_buffer_info);
 
@@ -271,8 +277,10 @@ class NativeCommandProcessor : public CommandProcessor {
     // XXH3 of the guest pages it was loaded from: a write elsewhere in those pages changes the version without
     // changing the texture (~4 needless reloads a frame in gameplay, 12 % of the GPU thread on the console).
     uint64_t content_hash = 0;
+    uint64_t generation = 0;  // §16.182: LoadTexture runs (a new image / view after each)
   };
   uint64_t TextureContentHash(const Texture& texture);
+  Texture* last_texture_ = nullptr;  // §16.182: the ordinary texture GetTextureDescriptor used last (else null)
   void EvictTextures();  // every 64 frames: textures not sampled for a while (they were never freed)
   std::vector<uint8_t> texture_scratch_;  // LoadTexture: the byte-swapped guest data of one slice
   // Format of the view GetTextureDescriptor chose last (for the sampler: no linear filter where unsupported).
@@ -330,6 +338,37 @@ class NativeCommandProcessor : public CommandProcessor {
   // inside the scene texture's range was pasted over the right 1/16 of the frame (lighter strip, 2026-11-12).
   std::unordered_map<uint32_t, uint64_t> resolved_frame_;
   uint64_t resolve_epoch_ = 0;  // resolves so far: the per-frame texture descriptor memo (BindTextures) is reset by it
+  // §16.168: resolved images created or replaced (GetResolved). A descriptor of an ordinary texture (not a resolved
+  // image, not a cube with resolved faces) changes on a resolve only through these: the memo keeps it otherwise.
+  uint64_t resolved_layout_epoch_ = 0;
+  // §16.172: the Xbox 360 draws the scene in two tiles (the 1200x704 G-buffer with depth does not fit its 10 MB EDRAM):
+  // every draw of the scene pass is submitted for the upper tile and again, with the window offset y = -352, for the
+  // lower one (all ~815 of them: the bin predicate culls nothing). Here the targets have room for the whole frame, so
+  // the first tile is drawn at full height (its scissor extended), the later tiles' draws are skipped, their resolves
+  // read their rows of the whole image, and the clears of the first tile's resolves (which would wipe the lower half
+  // before it is resolved) are left to the last tile's resolves. Learned from the previous frame's tile draws.
+  enum class TileRole : uint8_t { kNone, kFirst, kSkip };
+  struct TileMerge {
+    bool known = false;
+    uint32_t pitch = 0, depth_base = 0, color_base0 = 0;
+    uint32_t color_bases[4] = {};
+    uint32_t color_base_count = 0;
+    uint32_t tile_h = 0, full_h = 0;
+    uint64_t seen_frame = UINT64_MAX;      // last frame with a later-tile draw on these targets
+    uint64_t expanded_frame = UINT64_MAX;  // frame whose first tile was drawn at full height
+    uint64_t skipped_frame = UINT64_MAX;   // frame whose later tiles were skipped
+    uint32_t phase = 0;        // 1: first tile drawn whole; 2: later-tile draws skipped (their resolves follow)
+    uint32_t tile_offset = 0;  // rows of the tile being skipped (-window_y_offset)
+  } tile_merge_;
+  uint64_t predicated_reported_ = 0;
+  // §16.174: a touch with four fingers cycles through groups of pixel shaders not drawn (sdnx_skip_cycle): 0 = none.
+  std::vector<std::vector<std::string>> skip_cycle_groups_;
+  uint32_t skip_cycle_ = 0;
+  TileRole TileMergeClassify(const RegisterFile& regs);
+  bool ForcePredicatedDraw() override;  // §16.174
+  uint64_t forced_reported_ = 0;
+  bool TileMergeTarget(bool depth, uint32_t base, uint32_t pitch) const;
+  bool last_descriptor_strict_ = true;  // §16.168: set by GetTextureDescriptor - the descriptor depends on resolves
   std::unordered_map<uint32_t, uint32_t> resolved_extent_;  // destination base -> bytes the resolve covers  // by destination base, bumped by every resolve
   std::unordered_map<uint64_t, Texture> textures_;
   std::unordered_map<uint64_t, TextureView> views_;                  // (image, heap, swizzle) -> view
@@ -398,21 +437,27 @@ class NativeCommandProcessor : public CommandProcessor {
   // break of the rendering pass). For indices also their min / max (no scan for the vertex range).
   struct HashedGeometry {
     uint64_t content = 0;
-    VkDeviceSize offset = UINT64_MAX, size = 0;
-    uint64_t last_used = 0;
-    uint32_t index_min = 0, index_max = 0;
+    VkDeviceSize offset = UINT64_MAX;
     uint64_t hashed_frame = UINT64_MAX;  // last frame its content was hashed (and matched or was filled)
     uint64_t content_since = 0;          // frame the current content was filled
+    // §16.166: 32-bit size and frame, so that the entry fits a 64-byte bucket (the hashed buffer is 64-128 MB).
+    uint32_t size = 0;
+    uint32_t last_used = 0;
+    uint32_t index_min = 0, index_max = 0;
   };
   GpuBuffer* hashed_gpu_ = nullptr;
   uint8_t* hashed_mapping_ = nullptr;
   FreeBlocks hashed_free_;  // §16.139
   std::array<std::vector<std::pair<VkDeviceSize, VkDeviceSize>>, kFramesInFlight> hashed_retired_;
-  FlatMap64<HashedGeometry> hashed_;  // flat: several lookups per draw in ~20-30k entries
+  SwitchableFlatMap64<HashedGeometry> hashed_;  // flat: several lookups per draw in ~20-30k entries (§16.166)
   // The entry of `key` holding `content` (allocated and filled by `fill` when absent or different), or nullptr.
   HashedGeometry* HashedCopy(uint64_t key, uint64_t content, VkDeviceSize host_size, FillRef fill);
   // Same frame, stable content: the entry without hashing again (nullptr: hash and call HashedCopy).
   HashedGeometry* HashedReuse(uint64_t key, VkDeviceSize host_size);
+  // §16.162: the entry HashedReuse found (reusable or not) for HashedCopy, so it does not look the key up again.
+  uint64_t hashed_last_key_ = 0;
+  HashedGeometry* hashed_last_entry_ = nullptr;
+  uint64_t hashed_refused_logged_ = 0;  // §16.166
 
   // ---- Occlusion queries (native_query.cpp) ----
   // Without stalls: the guest gets the last known count of that sample-count address at once (1000 = visible
@@ -443,7 +488,7 @@ class NativeCommandProcessor : public CommandProcessor {
     uint64_t tex_loads = 0, tex_bytes = 0, tex_resolved = 0, tex_unsupported = 0, tex_signed = 0;
     uint64_t upload_full = 0, geo_first = 0, geo_hot = 0, geo_flagged = 0, geo_changed = 0;
     uint64_t geo_hits = 0, geo_uploads = 0, geo_bytes = 0, geo_dynamic = 0, geo_direct_bytes = 0;
-    uint64_t hash_hits = 0, hash_fills = 0, hash_fill_bytes = 0, hash_bytes = 0, hash_whole_bytes = 0, hash_reuse = 0; uint64_t constants_reused = 0, constants_bind_skipped = 0, tex_memo_hits = 0, shader_load_hits = 0, full_barriers = 0, textures_evicted = 0, attachment_barriers = 0, pass_barriers_skipped = 0; uint64_t prof_sub[3] = {};
+    uint64_t hash_hits = 0, hash_fills = 0, hash_fill_bytes = 0, hash_bytes = 0, hash_whole_bytes = 0, hash_reuse = 0; uint64_t constants_reused = 0, constants_bind_skipped = 0, tex_memo_hits = 0, tex_memo_kept = 0, tex_memo_carried = 0, tile_expanded = 0, tile_skipped = 0, tile_clears_skipped = 0, tile_resolves_moved = 0, const_uploads[3] = {}, const_bytes[3] = {}, const_sparse_saved = 0, shader_load_hits = 0, full_barriers = 0, textures_evicted = 0, attachment_barriers = 0, pass_barriers_skipped = 0; uint64_t prof_sub[3] = {};
     mutable uint64_t hot_checks = 0, hot_age = 0, hot_strikes = 0, hot_strikes_max = 0;  // PagesHot refusals (SDNX_PROF)  // content-hashed geometry copies
     uint64_t prof_ns[6] = {}, prof_draws = 0;  // SDNX_PROF: time of the parts of DrawNative (steady_clock ticks)
   } stats_;

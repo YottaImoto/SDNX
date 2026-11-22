@@ -28,6 +28,9 @@
 #include <rex/logging.h>
 #include <rex/memory.h>
 
+REXCVAR_DEFINE_BOOL(sdnx_draw_cpu_profile, true, "GPU",
+                    "Measure CPU time for each draw stage and include its breakdown in the periodic report");
+
 namespace rex::graphics::sdnx {
 
 namespace {
@@ -37,6 +40,38 @@ constexpr uint32_t kSpecConstantsUbo = 1u << 8;
 constexpr uint32_t kSpecAlphaTest = 1u << 1;
 
 uint32_t ByteSwap32(uint32_t v) { return __builtin_bswap32(v); }
+
+// §16.169: a copy into the CPU-cached upload ring. A store to a line that is not in the cache first reads the line
+// from memory (write-allocate), although the copy overwrites all of it; DC ZVA allocates the line already zeroed,
+// without that read. Only whole 64-byte lines inside the reserved block [dst, dst + reserved) are zeroed - the
+// rest is copied plainly. Used when DCZID_EL0 allows DC ZVA with 64-byte blocks (checked once).
+bool UploadZvaAvailable() {
+#if defined(__aarch64__)
+  uint64_t dczid = 0;
+  asm volatile("mrs %0, dczid_el0" : "=r"(dczid));
+  return !(dczid & 16) && (dczid & 15) == 4;  // DZP clear, block = 4 << 4 = 64 bytes
+#else
+  return false;
+#endif
+}
+
+void CopyToUpload(bool zva, uint8_t* dst, const void* src, uint32_t bytes, uint32_t reserved) {
+#if defined(__aarch64__)
+  if (zva && !(uintptr_t(dst) & 63)) {
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    const uint32_t lines = std::min(bytes, reserved) / 64;
+    for (uint32_t l = 0; l < lines; ++l) {
+      asm volatile("dc zva, %0" : : "r"(dst + l * 64) : "memory");
+      std::memcpy(dst + l * 64, s + l * 64, 64);
+    }
+    if (bytes > lines * 64) std::memcpy(dst + lines * 64, s + lines * 64, bytes - lines * 64);
+    return;
+  }
+#endif
+  (void)zva;
+  (void)reserved;
+  std::memcpy(dst, src, bytes);
+}
 
 // Copies guest data with the swap of its Xenos endianness (as the vertex / index fetch sees it).
 void CopySwapped(uint8_t* dst, const uint8_t* src, size_t size, xenos::Endian endian) {
@@ -363,7 +398,7 @@ void NativeCommandProcessor::ShutdownDraws() {
 }
 
 VkDeviceSize NativeCommandProcessor::Upload(const void* data, VkDeviceSize size, VkDeviceSize alignment,
-                                            uint8_t** mapping_out) {
+                                            uint8_t** mapping_out, VkDeviceSize written) {
   UploadBuffer& upload = upload_[uint32_t(frame_ % kFramesInFlight)];
   // §16.142: at least a cache line (64 bytes): with CPU-cached upload buffers no two allocations share a line, so
   // cleaning one written by the CPU never writes stale bytes over a neighbour the GPU writes (resolve staging).
@@ -378,7 +413,10 @@ VkDeviceSize NativeCommandProcessor::Upload(const void* data, VkDeviceSize size,
   upload.offset = offset + size;
   // §16.142: only what the CPU writes is cleaned; an allocation without data and without a mapping is GPU-only
   // staging (resolves copied to the buffer and back, ~25 MB a frame), which the CPU never touches (§16.143).
-  if (data || mapping_out) backend_->NoteUploadWritten(upload.gpu, offset, offset + size);
+  if (data || mapping_out) {
+    const VkDeviceSize noted = data ? size : std::min(size, written);
+    if (noted) backend_->NoteUploadWritten(upload.gpu, offset, offset + noted);
+  }
   return offset;
 }
 
@@ -400,10 +438,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     ++stats_.skipped;
     return true;
   }
-  // SDNX_PROF=1: CPU time of the parts of a draw (state/shaders, vertices, indices, constants and textures,
-  // pipeline, recording), in ReportStats.
-  // §16.133: always on (the console has no environment variables; nine clock reads a draw).
-  static const bool prof = true;
+  static const bool prof = REXCVAR_GET(sdnx_draw_cpu_profile);
   uint64_t prof_t[9] = {};
   auto prof_mark = [&](int i) {
     if (prof) prof_t[i] = SdnxTicks();  // §16.141
@@ -428,6 +463,16 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
                 vs ? 1 : 0, ps ? 1 : 0);
   }
   if (!vs || !index_count) return true;
+  // §16.172: the later tiles of a scene pass already drawn whole are not drawn again.
+  static const bool tile_merge = REXCVAR_GET(sdnx_tile_merge);
+  TileRole tile_role = TileRole::kNone;
+  if (tile_merge) {
+    tile_role = TileMergeClassify(regs);
+    if (tile_role == TileRole::kSkip) {
+      ++stats_.tile_skipped;
+      return true;
+    }
+  }
   const VertexShaderInfo* vs_info = nullptr;
   LibraryEntry* vs_entry = FindVertexShader(vs, vs_info);
   if (!vs_entry || !GetShader(*vs_entry)) {
@@ -448,22 +493,35 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     return true;
   }
   if (TryRestoreDepth(ps)) return true;
+  backend_->PrefetchShader(vs_entry->shader);  // §16.171
   auto edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   bool color_pass = edram_mode == xenos::EdramMode::kColorDepth;
   LibraryEntry* ps_entry = nullptr;
   if (ps && color_pass) {
     ps_entry = FindPixelShader(ps);
-    // SDNX_SKIP_PS=a,b,...: diagnostic, the draws of pixel shaders whose name contains one of the parts are dropped.
+    // SDNX_SKIP_PS=a,b,... or the cvar sdnx_skip_ps (§16.173): the draws of pixel shaders whose name contains one of
+    // the parts are dropped (diagnostics; turning effects off).
     static const std::vector<std::string> skip_ps = [] {
       std::vector<std::string> parts;
-      if (const char* env = std::getenv("SDNX_SKIP_PS")) {
-        std::stringstream ss(env);
-        for (std::string part; std::getline(ss, part, ',');) {
-          if (!part.empty()) parts.push_back(part);
-        }
+      std::string list = REXCVAR_GET(sdnx_skip_ps);
+      if (const char* env = std::getenv("SDNX_SKIP_PS")) list += std::string(",") + env;
+      std::stringstream ss(list);
+      for (std::string part; std::getline(ss, part, ',');) {
+        while (!part.empty() && part.front() == ' ') part.erase(part.begin());
+        while (!part.empty() && part.back() == ' ') part.pop_back();
+        if (!part.empty()) parts.push_back(part);
       }
+      if (!parts.empty()) REXGPU_INFO("[sdnx_native] pixel shaders not drawn (sdnx_skip_ps): {}", list);
       return parts;
     }();
+    if (ps_entry && skip_cycle_) {  // §16.174
+      for (const std::string& part : skip_cycle_groups_[skip_cycle_ - 1]) {
+        if (ps_entry->name.find(part) != std::string::npos) {
+          ++stats_.skipped;
+          return true;
+        }
+      }
+    }
     if (ps_entry && !skip_ps.empty()) {
       for (const std::string& part : skip_ps) {
         if (ps_entry->name.find(part) != std::string::npos) {
@@ -488,6 +546,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
       }
       return true;
     }
+    backend_->PrefetchShader(ps_entry->shader);  // §16.171
   }
 
   // Render targets.
@@ -503,6 +562,11 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   }
   draw_util::Scissor scissor;
   draw_util::GetScissor(regs, scissor);
+  // §16.172: the first tile at the height of the whole frame (the viewport follows the taller targets).
+  if (tile_role == TileRole::kFirst && scissor.offset[1] == 0 && scissor.extent[1] == tile_merge_.tile_h) {
+    scissor.extent[1] = tile_merge_.full_h;
+    ++stats_.tile_expanded;
+  }
   // Render targets are in EDRAM samples (see GetRenderTarget): MSAA draws are drawn scaled.
   uint32_t msaa_sx = uint32_t(surface.msaa_samples >= xenos::MsaaSamples::k4X);
   uint32_t msaa_sy = uint32_t(surface.msaa_samples >= xenos::MsaaSamples::k2X);
@@ -629,7 +693,13 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     for (size_t j = 0; j < vs_info->fetches.size(); ++j) {
       const VertexFetchRuntime& f = vs_info->fetches[j];
       if (used[j] || ((f.w0 >> 12) & 63) != slot.reg) continue;
-      int overlap = __builtin_popcount(SwizzleMask(f.w1 & 0xFFF) & slot.mask);
+      const uint32_t covered = SwizzleMask(f.w1 & 0xFFF) & slot.mask;
+      // The first full match already wins, including ties with later fetches.
+      if (covered == slot.mask) {
+        best = int(j);
+        break;
+      }
+      const int overlap = __builtin_popcount(covered);
       if (overlap > best_overlap) {
         best_overlap = overlap;
         best = int(j);
@@ -1208,6 +1278,18 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     }
     return 0;
   };
+  // §16.181: the registers a shader reads (its float bitmap), or null when it addresses them dynamically (then the
+  // whole range is needed). A vertex shader often reads a few low registers and a few high ones (bones, lights):
+  // copying everything below the highest was ~3.5 KB per VS upload, 4.5 MB a frame when driving (16.179).
+  static const bool sparse_constants = REXCVAR_GET(sdnx_sparse_constants);
+  auto constant_mask = [](Shader* shader) -> const uint64_t* {
+    if (!shader || !sparse_constants) return nullptr;
+    static string::StringBuffer mask_disassembly;
+    if (!shader->is_ucode_analyzed()) shader->AnalyzeUcode(mask_disassembly);  // arguments may be evaluated first
+    static const bool full_constants = std::getenv("SDNX_FULL_CONSTANTS") != nullptr;
+    const Shader::ConstantRegisterMap& map = shader->constant_register_map();
+    return (map.float_dynamic_addressing || full_constants) ? nullptr : map.float_bitmap;
+  };
   // The upload buffer is write-combined memory: on the console every byte written there per draw was expensive (the
   // store after the copies - the pipeline key's zero fill - held 11 % of the GPU thread, 2026-11-13). A block equal to
   // the one uploaded last in this frame reuses that copy: compared in ordinary memory, nothing written.
@@ -1215,23 +1297,104 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     uint64_t frame = UINT64_MAX;
     VkDeviceSize offset = 0;
     uint32_t range = 0, bytes = 0;
+    const uint8_t* mapped = nullptr;  // §16.160: the uploaded copy itself, compared when uploads are CPU-cached
+    uint64_t written[4] = {};  // §16.181: the registers this copy holds (all below bytes when it was copied whole)
     alignas(16) uint8_t data[4096];
   };
+  // §16.160: with CPU-cached upload buffers the last upload is compared in place, so the second copy into
+  // copy.data is not made; and only the bytes the shaders read are cleaned from the cache (not the whole range).
+  // The two copies per changed block were ~7 % of this thread when driving (LR samples, 16.158).
+  static const bool compare_in_upload = backend_->UploadMemoryCached();
   static UploadedCopy vs_copy, ps_copy, shared_copy;
-  auto upload_reused = [&](UploadedCopy& copy, const void* values, uint32_t range, uint32_t used_bytes) -> VkDeviceSize {
+  // §16.169: DC ZVA only into CPU-cached memory (the write-combined ring gains nothing from it).
+  static const bool upload_zva = [&] {
+    const bool on = compare_in_upload && REXCVAR_GET(sdnx_upload_zva) && UploadZvaAvailable();
+    REXGPU_INFO("[sdnx_native] constant uploads with DC ZVA: {}", on ? "yes" : "no");
+    return on;
+  }();
+  // §16.156: with the byte range of the block written since the previous draw (dirty_lo / dirty_hi, from
+  // NoteConstantWrites), only that range is compared: after every call copy.data equals the registers below
+  // copy.bytes, so the rest cannot differ. The full 4 KB compares were ~6 % of this thread when driving.
+  auto upload_reused = [&](UploadedCopy& copy, const void* values, uint32_t range, uint32_t used_bytes,
+                           uint32_t* dirty_lo = nullptr, uint32_t* dirty_hi = nullptr,
+                           const uint64_t* mask_in = nullptr) -> VkDeviceSize {
     used_bytes = std::min(used_bytes, range);
-    if (copy.frame == frame_ && copy.range == range && copy.bytes == used_bytes &&
-        std::memcmp(copy.data, values, used_bytes) == 0) {
+    uint32_t cmp_lo = 0, cmp_hi = used_bytes;
+    if (dirty_lo && dirty_hi) {
+      cmp_lo = std::min(*dirty_lo, used_bytes);
+      cmp_hi = std::min(*dirty_hi, used_bytes);
+      *dirty_lo = UINT32_MAX;
+      *dirty_hi = 0;
+    }
+    // §16.181: the registers needed (whole 16-byte registers below used_bytes; all of them without a mask).
+    const uint32_t regs_used = (used_bytes + 15) / 16;
+    uint64_t need[4] = {};
+    for (uint32_t w = 0; w < 4; ++w) {
+      const uint32_t lo = w * 64;
+      if (regs_used <= lo) break;
+      const uint64_t below = regs_used - lo >= 64 ? ~0ull : ((1ull << (regs_used - lo)) - 1);
+      need[w] = (mask_in ? mask_in[w] : ~0ull) & below;
+    }
+    const uint8_t* old = compare_in_upload ? copy.mapped : copy.data;
+    const uint8_t* now = static_cast<const uint8_t*>(values);
+    auto same = [&]() {
+      if (cmp_lo >= cmp_hi) return true;
+      if (!mask_in) return std::memcmp(old + cmp_lo, now + cmp_lo, cmp_hi - cmp_lo) == 0;
+      // only the needed registers inside the written range
+      for (uint32_t w = 0; w < 4; ++w) {
+        uint64_t bits = need[w];
+        while (bits) {
+          const uint32_t first = uint32_t(__builtin_ctzll(bits));
+          const uint64_t run = (bits >> first) == ~0ull >> first ? ~0ull >> first : 0;
+          uint32_t len = run ? 64 - first : uint32_t(__builtin_ctzll(~(bits >> first)));
+          const uint32_t a = std::max((w * 64 + first) * 16, cmp_lo);
+          const uint32_t b = std::min((w * 64 + first + len) * 16, cmp_hi);
+          if (a < b && std::memcmp(old + a, now + a, b - a) != 0) return false;
+          bits &= len >= 64 ? 0 : ~(((1ull << len) - 1) << first);
+        }
+      }
+      return true;
+    };
+    const bool covered = (need[0] & ~copy.written[0]) == 0 && (need[1] & ~copy.written[1]) == 0 &&
+                         (need[2] & ~copy.written[2]) == 0 && (need[3] & ~copy.written[3]) == 0;
+    if (copy.frame == frame_ && copy.range == range && copy.bytes == used_bytes && covered && same()) {
       ++stats_.constants_reused;
       return copy.offset;
     }
     uint8_t* dst = nullptr;
-    VkDeviceSize at = Upload(nullptr, range, ubo_align, &dst);
-    if (at == UINT64_MAX) return at;
-    if (used_bytes) {
-      std::memcpy(dst, values, used_bytes);
-      std::memcpy(copy.data, values, used_bytes);
+    VkDeviceSize at = Upload(nullptr, range, ubo_align, &dst, used_bytes);
+    if (at == UINT64_MAX) {
+      copy.frame = UINT64_MAX;  // the dirty range was consumed: the next call compares everything again
+      return at;
     }
+    {
+      const int block = &copy == &vs_copy ? 0 : (&copy == &ps_copy ? 1 : 2);  // §16.171: per-block statistics
+      ++stats_.const_uploads[block];
+      stats_.const_bytes[block] += used_bytes;
+    }
+    if (used_bytes && mask_in) {
+      // §16.181: the needed registers only, run by run; the gaps keep whatever the ring held (never read).
+      uint32_t copied = 0;
+      for (uint32_t w = 0; w < 4; ++w) {
+        uint64_t bits = need[w];
+        while (bits) {
+          const uint32_t first = uint32_t(__builtin_ctzll(bits));
+          const uint64_t rest = bits >> first;
+          const uint32_t len = rest == (~0ull >> first) ? 64 - first : uint32_t(__builtin_ctzll(~rest));
+          const uint32_t a = (w * 64 + first) * 16, n = len * 16;
+          std::memcpy(dst + a, now + a, n);
+          if (!compare_in_upload) std::memcpy(copy.data + a, now + a, n);
+          copied += n;
+          bits &= len >= 64 ? 0 : ~(((1ull << len) - 1) << first);
+        }
+      }
+      stats_.const_sparse_saved += used_bytes - copied;
+    } else if (used_bytes) {
+      CopyToUpload(upload_zva, dst, values, used_bytes, range);  // §16.169
+      if (!compare_in_upload) std::memcpy(copy.data, values, used_bytes);
+    }
+    std::memcpy(copy.written, need, sizeof(need));
+    copy.mapped = dst;
     copy.frame = frame_;
     copy.offset = at;
     copy.range = range;
@@ -1286,12 +1449,22 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     push_block(1, ps_mirror_, reinterpret_cast<const uint8_t*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X]),
                224 * 16, ps_dirty_lo_, ps_dirty_hi_);
   } else {
+    static const bool dirty_compare = std::getenv("SDNX_FULL_CONSTANT_COMPARE") == nullptr;  // A/B
     vs_constants = upload_reused(vs_copy, &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X], 4096,
-                                 used_constant_bytes(vs, 256));
+                                 used_constant_bytes(vs, 256), dirty_compare ? &vs_dirty_lo_ : nullptr,
+                                 dirty_compare ? &vs_dirty_hi_ : nullptr, constant_mask(vs));
     ps_constants = upload_reused(ps_copy, &regs.values[XE_GPU_REG_SHADER_CONSTANT_256_X], 224 * 16,
-                                 ps_entry ? used_constant_bytes(ps, 224) : 0);
+                                 ps_entry ? used_constant_bytes(ps, 224) : 0, dirty_compare ? &ps_dirty_lo_ : nullptr,
+                                 dirty_compare ? &ps_dirty_hi_ : nullptr, ps_entry ? constant_mask(ps) : nullptr);
   }
-  uint32_t shared[kSharedBlockSize / 4] = {};
+  // §16.169: the block is kept between draws; only the descriptor numbers (bytes 0-255: the slots a draw does not
+  // bind must read 0) are cleared. Everything else is written on every draw, except the vertex pull info (bytes
+  // 688+), read only by draws that pull - and only then copied. Was: a 944-byte zero fill and copy per draw.
+  static const bool shared_lean = REXCVAR_GET(sdnx_shared_lean);
+  alignas(64) static uint32_t shared_block[kSharedBlockSize / 4] = {};
+  uint32_t* const shared = shared_block;
+  std::memset(shared_block, 0, shared_lean ? 256 : sizeof(shared_block));
+  const uint32_t shared_used = (pull || !shared_lean) ? kSharedBlockSize : kPullInfoOffset;
   shared[256 / 4] = regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031];
   float alpha_ref = regs.Get<float>(XE_GPU_REG_RB_ALPHA_REF);
   std::memcpy(&shared[272 / 4], &alpha_ref, 4);
@@ -1311,7 +1484,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     std::memcpy(&shared[(360 + s * 8) / 4], &one, 4);
     std::memcpy(&shared[(364 + s * 8) / 4], &one, 4);
   }
-  for (uint32_t k = 0; k < 32; ++k) shared[(624 / 4) + k / 2] |= swizzle_codes[k] << ((k & 1) * 16);
+  for (uint32_t k = 0; k < 32; k += 2) shared[(624 / 4) + k / 2] = swizzle_codes[k] | swizzle_codes[k + 1] << 16;
   if (pull) std::memcpy(&shared[kPullInfoOffset / 4], pull_info, sizeof(pull_info));
   uint32_t spec = kSpecConstantsUbo;
   // §16.130: ALWAYS (7) never discards: no alpha test, so deko3d can bind the variant without discard (early Z).
@@ -1340,7 +1513,7 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
   const float pixel_scale = target_scaled ? 1.0f / backend_->RenderScale() : 1.0f;
   std::memcpy(&shared[620 / 4], &pixel_scale, 4);
   BindTextures(vs, ps_entry ? ps : nullptr, shared);
-  VkDeviceSize shared_constants = upload_reused(shared_copy, shared, sizeof(shared), sizeof(shared));
+  VkDeviceSize shared_constants = upload_reused(shared_copy, shared, kSharedBlockSize, shared_used);
   if (vs_constants == UINT64_MAX || ps_constants == UINT64_MAX || shared_constants == UINT64_MAX) {
     ++stats_.skipped;
     return true;
@@ -1522,6 +1695,17 @@ bool NativeCommandProcessor::DrawNative(xenos::PrimitiveType prim_type, uint32_t
     rendering_ = true;
     rendering_key_ = rendering_key;
     BeginHostQuery();  // continues an open guest occlusion query in this pass
+  }
+  if (guest_query_active_) {  // §16.161
+    ++qdiag_draws_;
+    if (!host_query_open_) ++qdiag_no_pass_;
+    if (!depth) {
+      ++qdiag_no_depth_;
+    } else if (!depth_control.z_enable) {
+      ++qdiag_no_ztest_;
+    } else if (depth_control.zfunc == xenos::CompareFunction::kAlways) {
+      ++qdiag_always_;
+    }
   }
   packet.viewport = {float(viewport.xy_offset[0]), float(viewport.xy_offset[1]), float(viewport.xy_extent[0]),
                      float(viewport.xy_extent[1]), viewport.z_min, viewport.z_max};

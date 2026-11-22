@@ -63,6 +63,12 @@ class SdRetailApp : public rex::ReXApp {
     // ("accept"), B (bottom) as B, X as X, Y as Y - what Switch players expect (user's choice, 2026-11-10). The
     // glyphs must then be patched with port/tools/apply_branding.py --by-letter. input_xbox_layout = true in
     // sdretail.toml gives the layout by position (then patch the data without --by-letter).
+    // §16.159: X and Y swapped, A and B kept (user's choice, 2026-11-20): Switch Y (left) does the Xbox X action,
+    // Switch X (top) the Xbox Y action. Glyphs: apply_branding.py --by-letter --swap-xy. An explicit
+    // input_swap_xy = false in sdretail.toml turns it off.
+    if (!rex::cvar::HasNonDefaultValue("input_swap_xy")) {
+      rex::cvar::SetFlagByName("input_swap_xy", "true");
+    }
   }
 
   // The Switch has no command line: when --game_data_root is not given, use the game_root/ folder
