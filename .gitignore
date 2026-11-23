@@ -11,6 +11,7 @@
 !/nx/
 /nx/*
 !/nx/sdretail/
+!/nx/upstream/
 !/nx/deko3d/
 !/nx/dktest/
 /nx/dktest/build/
