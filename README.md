@@ -13,15 +13,16 @@ The Xbox 360 release of **Sleeping Dogs**, lifted instruction by instruction to 
 ![Version](https://img.shields.io/badge/version-0.1.0-blue)
 ![Status](https://img.shields.io/badge/status-WIP-orange)
 
-[Features](#-features) · [Status](#-status) · [Performance](#-performance) · [Renderer](#-the-native-renderer) · [Building](#%EF%B8%8F-building) · [Roadmap](#%EF%B8%8F-roadmap) · [Legal](#%EF%B8%8F-legal)
+[Features](#-features) · [Status](#-status) · [Performance](#-performance) · [Current ReXGlue](#-the-port-to-the-current-rexglue) · [Renderer](#-the-native-renderer) · [Building](#%EF%B8%8F-building) · [Roadmap](#%EF%B8%8F-roadmap) · [Legal](#%EF%B8%8F-legal)
 
 </div>
 
 ---
 
 > [!WARNING]
-> **Work in progress.** The game boots, plays its videos and runs gameplay on a real console without crashing
-> (17+ minute sessions), but at ~15–19 fps in handheld mode, below the 30 fps target. There is no prebuilt NRO.
+> **Work in progress.** The game boots, plays its videos and runs gameplay on a real console without crashing, now
+> on the current ReXGlue SDK (see [The port to the current ReXGlue](#-the-port-to-the-current-rexglue)), but at
+> ~16–19 fps in handheld gameplay, below the 30 fps target. There is no prebuilt NRO.
 
 > [!IMPORTANT]
 > **No game data is included.** You need your own copy of the Xbox 360 disc. The recompiled code, the shader
@@ -54,7 +55,8 @@ The Xbox 360 release of **Sleeping Dogs**, lifted instruction by instruction to 
 | Rendering (console, deko3d) | ✅ Correct picture: lighting, shadows, haze, post-processing. Known glitches: lens flare visible through objects, some UI icons partly garbled, glass shimmering while moving |
 | Rendering (bench, Vulkan) | ✅ Matches the Xenos emulation |
 | Audio | ✅ Works, no delay |
-| Performance | ⚠️ ~15–19 fps in handheld gameplay at stock clocks (target: 30), GPU-bound now |
+| Performance | ⚠️ ~16–19 fps in handheld gameplay with sys-clk (target: 30); since LTO the GPU (~50 ms a frame) holds the frame |
+| SDK | ✅ Moved to the current ReXGlue (upstream nightly), no Vulkan in the Switch build; saves shared with the older builds |
 | Online | ⚠️ The game asks to sign in to Xbox LIVE (menu badge, social hub, DLC menu); network prompts still to be removed |
 | Branding patch | ⚠️ Text and buttons ready; Xbox LIVE prompts are not covered yet |
 | Exit | ⚠️ Closing the game ends in a system module error (pcv / clock service) |
@@ -97,6 +99,29 @@ post-processing ~7, half-resolution effects ~4, final image with UI ~2, and ~14 
 extraction, color blits for resolves, full barriers, copies). On the CPU the GPU command thread takes ~50 % of a
 core, the game's main thread ~38 %, Wwise ~17 %, four worker threads ~24 % each.
 
+##  The port to the current ReXGlue
+
+The Switch build first ran on a fork of ReXGlue 0.10. It now runs on the current upstream SDK (its module and driver
+interfaces, flat settings), with the Switch parts brought over as drivers: audio (audout), input (HID), UI (NWindow,
+applet events) and the renderer as the `sdnx` Xenos graphics driver on deko3d. The title app for it is in
+`nx/upstream/` (`main.cpp`, `CMakeLists.txt`, the code-generation options in `perf_overrides.toml`). The SDK side
+of this port is not published yet.
+
+What the new build needed to reach and pass the old one (measured on the console, handheld, sys-clk
+CPU 1963 MHz / GPU 998 MHz):
+
+| Change | Effect |
+| --- | --- |
+| Exception entry without the deadlock, hot read-only pages unwatched, host ticks from the system counter | the game reaches gameplay at its real speed (the clock had run 52× fast) |
+| `[vector_math] "fused"` in the code generator: VMX multiply-add as one fused instruction, dot products truncated as the console does | cutscenes 10 fps → playable; no Wwise NaNs |
+| Per-thread cache in front of newlib's allocator (`nx/sdretail/src/sdnx_malloc.cpp`, `--wrap`) | the GPU command thread no longer waits on the process-wide malloc lock (31 % of its samples); one draw 9–12 → ~5–7 µs |
+| Game code at `-O3`, then **LTO** of the game code, the app and the SDK (`SDNX_LTO`, its own build tree via `REXGLUE_OUTPUT_SUFFIX`) | one draw ~5 µs as in the fork; the GPU command thread stops waiting for the game |
+| Threads wait on Horizon's address arbiter, XMA kicks without the context lock (renut_nx_ultimate_base ports 65 and 120) | fewer wake-up stalls between game threads and audio |
+| Resolve clears only within the resolve rectangle, unchanged resolves skipped (16.233, not measured yet) | GPU: the EDRAM-height (2048-row) targets were cleared whole for a ~720-row frame |
+
+Every one of them has a switch in `sdretail.toml`. Next: the GPU (~15 ms of the ~50 ms frame is emulation overhead:
+depth extraction, resolve blits, barriers), then PGO.
+
 ##  The native renderer
 
 `renderer/` is the renderer for ReXGlue that replaces the emulation of the Xenos GPU for this game. It is a snapshot
@@ -134,19 +159,20 @@ Not packaged for others yet; the steps are written down for this machine in [doc
 
 `nx/desktop` builds the same game for Windows with the Vulkan backend: the bench where rendering is debugged.
 
+The current-SDK build: `nx/upstream/` is added to the Switch SDK's CMake tree as its title directory
+(`REXGLUE_SWITCH_TITLE_DIR`); `-DSDNX_LTO=ON -DREXGLUE_OUTPUT_SUFFIX=-lto` gives the LTO build in a tree of its own.
+
 ##  Roadmap
 
-1. **Performance to 30 fps at stock clocks**:
-   - GPU: find out which effect each heavy pass is (shader names are in the profile now) and make the costly ones
-     cheaper or optional; cut the emulation overhead (depth extraction straight into resolve images, fewer color
-     blits and full barriers);
-   - CPU: more guest functions without `volatile`, cheaper draw setup on the GPU command thread.
-   - Overclocking is not part of the plan; it comes last, if at all.
+1. **Performance to 30 fps** (measured with sys-clk; stock clocks are the floor):
+   - GPU, the limit since LTO: cut the emulation overhead (depth extraction, resolve blits, full barriers) without
+     changing the picture, then the costly passes;
+   - CPU: PGO on top of LTO; more guest functions without `volatile`.
 2. **Rendering glitches**: lens flare through objects, garbled UI icons, glass shimmer.
 3. **Offline mode**: hide the Xbox LIVE sign-in prompts and the online badge.
 4. **Exit crash** in the system modules.
-5. Later: DLC with a Russian translation, the Definitive Edition camera, language selection in the settings, a move
-   to a newer ReXGlue release.
+5. **Publish the SDK side** of the port to the current ReXGlue.
+6. Later: DLC with a Russian translation, the Definitive Edition camera, language selection in the settings.
 
 ##  Legal
 

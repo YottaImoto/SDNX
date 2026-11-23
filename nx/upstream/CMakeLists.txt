@@ -29,5 +29,31 @@ endforeach()
 string(JOIN "," sdnx_archives_csv ${sdnx_archives})
 target_link_options(sdretail PRIVATE "LINKER:--whole-archive,${sdnx_archives_csv},--no-whole-archive")
 target_link_libraries(sdretail PRIVATE ${sdnx_modules} rexglue_switch_startup)
-rexglue_switch_add_nro(sdretail NAME "Sleeping Dogs" AUTHOR "SDNX" VERSION "16.230"
+# SDNX 16.232: link-time optimisation (the fork's 16.196; renut base: PGO + LTO were SASRT's biggest CPU win). The game
+# code, the app and the SDK modules are compiled to GIMPLE and optimised as one program at the link. Build it in a tree
+# of its own with -DREXGLUE_OUTPUT_SUFFIX=-lto: GIMPLE-only libraries must not replace the everyday tree's.
+# Out of LTO: files with top-level asm naming C symbols and the files defining --wrap's __wrap_ functions (the startup
+# object library is not in the list at all), and deko3d_backend.cpp as in the fork.
+option(SDNX_LTO "Link-time optimisation of the game code, the app and the SDK modules" OFF)
+set(SDNX_LTO_JOBS "6" CACHE STRING "Parallel LTRANS jobs of the LTO link")
+if(SDNX_LTO)
+  set(_sdnx_lto_targets sdretail sdretail_guest ${sdnx_modules})
+  foreach(_target IN LISTS _sdnx_lto_targets)
+    target_compile_options(${_target} PRIVATE "$<$<COMPILE_LANGUAGE:C,CXX>:-flto;-fno-fat-lto-objects>")
+    target_compile_definitions(${_target} PRIVATE XXH_FORCE_MEMORY_ACCESS=0)
+  endforeach()
+  target_link_options(sdretail PRIVATE -flto=${SDNX_LTO_JOBS} -flto-partition=balanced -ffp-contract=off
+                      -fno-strict-aliasing -O3)
+  set_property(SOURCE "${PROJECT_SOURCE_DIR}/src/base/threading_posix.cpp"
+                      "${PROJECT_SOURCE_DIR}/src/base/exception_handler_switch.cpp"
+                      "${PROJECT_SOURCE_DIR}/src/base/fiber_switch.cpp"
+               TARGET_DIRECTORY rexbase APPEND PROPERTY COMPILE_OPTIONS -fno-lto)
+  set_property(SOURCE "${PROJECT_SOURCE_DIR}/src/gpu/xenos/sdnx/deko3d_backend.cpp"
+               TARGET_DIRECTORY rexgpu-xenos-sdnx APPEND PROPERTY COMPILE_OPTIONS -fno-lto)
+  set_property(SOURCE "${sdnx_common}/sdnx_memset.cpp" "${sdnx_common}/sdnx_malloc.cpp"
+               APPEND PROPERTY COMPILE_OPTIONS -fno-lto)
+  message(STATUS "SDNX: LTO (${SDNX_LTO_JOBS} LTRANS jobs)")
+endif()
+
+rexglue_switch_add_nro(sdretail NAME "Sleeping Dogs" AUTHOR "SDNX" VERSION "16.233"
                        ICON "${CMAKE_CURRENT_LIST_DIR}/../sdretail/icon.jpg")
