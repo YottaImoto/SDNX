@@ -4,6 +4,10 @@
 
 #include "sdretail_app.h"
 
+REXCVAR_DEFINE_INT32(sdretail_handheld_gpu_mhz, 460, "Sleeping Dogs",
+                     "Handheld GPU clock requested from Horizon (apm): 460 (official 460.8 MHz configuration, "
+                     "memory unchanged), 384, or 0 = leave the clocks alone (307.2 MHz). Docked is not touched");
+
 #ifdef __SWITCH__
 // Loaders that start the NRO without a program name (Ryujinx: argv[0] = null) would leave the SDK
 // without the executable folder, where game_root/ and the configuration live. hbloader always passes it.

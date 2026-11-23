@@ -1,8 +1,12 @@
 // Sleeping Dogs for Nintendo Switch: hooks that change only how fast the game runs, never what it does.
 
+#ifdef SDNX_UPSTREAM_SDK
+#include <rex/ppc/hook.h>
+#else
 #include <rex/hook.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
+#endif
 
 #include <atomic>
 #include <cstdint>

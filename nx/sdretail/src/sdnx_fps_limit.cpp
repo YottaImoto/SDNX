@@ -20,11 +20,19 @@
 //   an unknown AS function is ignored by GFx.
 
 #include <rex/cvar.h>
+#ifdef SDNX_UPSTREAM_SDK
+#include <rex/platform/file.h>
+#include <rex/ppc/hook.h>
+#include <rex/ppc/kernel_hook.h>
+namespace sd_files = rex::platform;
+#else
 #include <rex/filesystem.h>
 #include <rex/hook.h>
+#include <rex/ppc/func.h>
+namespace sd_files = rex::filesystem;
+#endif
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
-#include <rex/ppc/func.h>
 
 #include <algorithm>
 #include <atomic>
@@ -66,7 +74,7 @@ uint32_t Load32(uint8_t* base, uint32_t addr) {
 // [log.levels], other settings). rex::cvar::SaveConfig is not used: it rewrites the file with the cvars only.
 void SaveLimit(int limit) {
   REXCVAR_SET(sdretail_fps_limit, limit);
-  const std::filesystem::path path = rex::filesystem::GetExecutableFolder() / "sdretail.toml";
+  const std::filesystem::path path = sd_files::GetExecutableFolder() / "sdretail.toml";
   const std::string setting = "sdretail_fps_limit = " + std::to_string(limit);
 
   std::vector<std::string> lines;
@@ -174,7 +182,11 @@ REX_HOOK_RAW(sub_827C9358) {
   ctx.r6.u64 = value;
   ctx.r7.u64 = 1;
   bool shown = false;
+#ifdef SDNX_UPSTREAM_SDK
+  if (PPCFunc* fn = rex::ppc::TryResolveFunction(invoke)) {
+#else
   if (PPCFunc* fn = rex::runtime::ResolveIndirectFunction(invoke)) {
+#endif
     fn(ctx, base);
     shown = (ctx.r3.u32 & 0xFF) != 0;
   }

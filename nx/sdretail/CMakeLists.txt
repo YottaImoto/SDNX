@@ -119,11 +119,78 @@ if(SDNX_PGO)
     else()
         message(FATAL_ERROR "SDNX_PGO must be empty, generate or use (got ${SDNX_PGO})")
     endif()
-    foreach(_target sdretail sdretail_recomp)
+    # SDNX 16.190: the SDK too - our renderer (rexgpu-xenos: the GPU command thread, the busiest after 16.189) and the
+    # runtime (kernel calls, threads, critical sections, audio, file system, input, UI). FFmpeg and the other third-party
+    # libraries stay out. SDNX_PGO_SDK=OFF instruments the game code alone, as in 16.188.
+    option(SDNX_PGO_SDK "PGO of the SDK runtime and renderer as well" ON)
+    set(_sdnx_pgo_targets sdretail sdretail_recomp)
+    if(SDNX_PGO_SDK)
+        list(APPEND _sdnx_pgo_targets rexgpu-xenos rexruntime rexcore rexaudio rexfilesystem rexinput rexui)
+    endif()
+    foreach(_target ${_sdnx_pgo_targets})
         if(TARGET ${_target})
-            target_compile_options(${_target} PRIVATE ${_sdnx_pgo})
+            target_compile_options(${_target} PRIVATE "$<$<COMPILE_LANGUAGE:C,CXX>:${_sdnx_pgo}>")
         endif()
     endforeach()
     target_link_options(sdretail PRIVATE ${_sdnx_pgo})
+    set(_sdnx_sdk_own_dir ON)
     message(STATUS "SDNX: PGO ${SDNX_PGO} (${SDNX_PGO_DIR})")
+endif()
+
+# SDNX 16.196: link-time optimisation (renut_nx_ultimate_base's sa2-nx method: on SASRT LTO + PGO took the render and
+# game threads ~20 % down). The game code, the app and the SDK runtime and renderer are compiled to GIMPLE
+# (-flto -fno-fat-lto-objects) and optimised as one program at the link: guest functions in different generated files
+# can be inlined into each other. -flto=N LTRANS jobs (memory: WSL has 12 GB since 16.192). The link repeats
+# -ffp-contract=off and -fno-strict-aliasing (the LTRANS stage must not fuse what the compile kept apart), and
+# xxHash's direct memory access is off (nfsmw-nx: garbage cache keys once xxHash was inlined under LTO).
+# Out of LTO (-fno-lto): files that define --wrap's __wrap_ functions (the link must see them as ordinary
+# definitions) and files with top-level asm that names C symbols (invisible to LTO, which would drop them).
+option(SDNX_LTO "Link-time optimisation of the game code, the app and the SDK runtime and renderer" OFF)
+set(SDNX_LTO_JOBS "4" CACHE STRING "Parallel LTRANS jobs of the LTO link")
+if(SDNX_LTO)
+    set(_sdnx_lto_compile -flto -fno-fat-lto-objects)
+    foreach(_target sdretail sdretail_recomp rexgpu-xenos rexruntime rexcore rexaudio rexfilesystem rexinput rexui)
+        if(TARGET ${_target})
+            target_compile_options(${_target} PRIVATE "$<$<COMPILE_LANGUAGE:C,CXX>:${_sdnx_lto_compile}>")
+            target_compile_definitions(${_target} PRIVATE XXH_FORCE_MEMORY_ACCESS=0)
+        endif()
+    endforeach()
+    target_link_options(sdretail PRIVATE -flto=${SDNX_LTO_JOBS} -flto-partition=balanced -ffp-contract=off
+                        -fno-strict-aliasing)
+    get_filename_component(_sdnx_sdk_src "${REXSDK_DIR}" ABSOLUTE)
+    set_property(SOURCE "${_sdnx_sdk_src}/src/core/exception_handler_switch.cpp"
+                        "${_sdnx_sdk_src}/src/core/fiber_switch.cpp"
+                 TARGET_DIRECTORY rexcore APPEND PROPERTY COMPILE_OPTIONS -fno-lto)
+    set_property(SOURCE "${_sdnx_sdk_src}/src/ui/switch_perf.cpp"
+                 TARGET_DIRECTORY rexui APPEND PROPERTY COMPILE_OPTIONS -fno-lto)
+    set_property(SOURCE "${_sdnx_sdk_src}/src/graphics/sdnx/deko3d_backend.cpp"
+                 TARGET_DIRECTORY rexgpu-xenos APPEND PROPERTY COMPILE_OPTIONS -fno-lto)
+    set_property(SOURCE src/sdnx_memset.cpp APPEND PROPERTY COMPILE_OPTIONS -fno-lto)
+    set(_sdnx_sdk_own_dir ON)
+    message(STATUS "SDNX: LTO (${SDNX_LTO_JOBS} jobs)")
+endif()
+
+# A PGO or LTO build tree keeps every SDK library in the tree (the SDK puts them all in sdk/out/switch-arm64, shared
+# by every build tree: an instrumented or GIMPLE-only librexruntime.a would end up in the everyday NRO).
+if(_sdnx_sdk_own_dir)
+    function(_sdnx_sdk_targets dir out)
+        get_property(_t DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+        get_property(_subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+        foreach(_d ${_subdirs})
+            _sdnx_sdk_targets("${_d}" _more)
+            list(APPEND _t ${_more})
+        endforeach()
+        set(${out} ${_t} PARENT_SCOPE)
+    endfunction()
+    get_filename_component(_sdnx_sdk_dir "${REXSDK_DIR}" ABSOLUTE)
+    _sdnx_sdk_targets("${_sdnx_sdk_dir}" _sdnx_sdk_all)
+    set(_sdnx_moved 0)
+    foreach(_target ${_sdnx_sdk_all})
+        get_target_property(_type ${_target} TYPE)
+        if(_type STREQUAL "STATIC_LIBRARY")
+            set_target_properties(${_target} PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/sdk-lib")
+            math(EXPR _sdnx_moved "${_sdnx_moved} + 1")
+        endif()
+    endforeach()
+    message(STATUS "SDNX: ${_sdnx_moved} SDK libraries in ${CMAKE_BINARY_DIR}/sdk-lib")
 endif()

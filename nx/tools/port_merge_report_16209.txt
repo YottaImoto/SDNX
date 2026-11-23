@@ -1,0 +1,126 @@
+CLEAN     resources/templates/codegen/sources_cmake.inja
+CLEAN     src/codegen/CMakeLists.txt
+CONFLICT 1 include/rex/platform/dynlib.h
+CONFLICT 1 resources/templates/codegen/register_cpp.inja
+CONFLICT 1 src/codegen/project_recompiler.cpp
+CONFLICT 1 src/filesystem/CMakeLists.txt
+CONFLICT 1 src/ui/CMakeLists.txt
+CONFLICT 2 include/rex/filesystem/file.h
+CONFLICT 2 include/rex/platform.h
+CONFLICT 2 resources/templates/codegen/_indirect_call.inja
+CONFLICT 2 src/codegen/config.cpp
+CONFLICT 3 resources/templates/codegen/pch_h.inja
+CONFLICT 3 src/kernel/xboxkrnl/xboxkrnl_audio.cpp
+CONFLICT 3 src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+CONFLICT 3 src/ui/overlay/debug_overlay.cpp
+CONFLICT 4 src/codegen/codegen_writer.cpp
+CONFLICT 4 src/kernel/xboxkrnl/xboxkrnl_io.cpp
+CONFLICT 4 src/kernel/xboxkrnl/xboxkrnl_module.cpp
+CONFLICT 5 CMakeLists.txt
+CONFLICT 5 include/rex/ppc/context.h
+CONFLICT 5 src/ui/overlay/settings_overlay.cpp
+CONFLICT 7 src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp
+CONFLICT 7 src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
+GONE      cmake/rexglue_helpers.cmake
+GONE      include/rex/audio/audio_system.h
+GONE      include/rex/audio/conversion.h
+GONE      include/rex/audio/sdl/sdl_audio_driver.h
+GONE      include/rex/audio/xma/context.h
+GONE      include/rex/codegen/config.h
+GONE      include/rex/filesystem/devices/host_path_device.h
+GONE      include/rex/filesystem/devices/host_path_entry.h
+GONE      include/rex/filesystem/devices/host_path_file.h
+GONE      include/rex/filesystem/devices/stfs_xbox.h
+GONE      include/rex/graphics/command_processor.h
+GONE      include/rex/graphics/pipeline/shader/spirv_translator.h
+GONE      include/rex/graphics/primitive_processor.h
+GONE      include/rex/input/input_system.h
+GONE      include/rex/input/mnk/mnk_input_driver.h
+GONE      include/rex/kernel/xboxkrnl/module.h
+GONE      include/rex/logging/types.h
+GONE      include/rex/memory/utils.h
+GONE      include/rex/ppc.h
+GONE      include/rex/system/function_dispatcher.h
+GONE      include/rex/system/util/object_table.h
+GONE      include/rex/system/xfile.h
+GONE      include/rex/system/xmemory.h
+GONE      include/rex/thread.h
+GONE      include/rex/thread/fiber.h
+GONE      include/rex/ui/overlay/debug_overlay.h
+GONE      include/rex/ui/overlay/settings_overlay.h
+GONE      include/rex/ui/presenter.h
+GONE      include/rex/ui/renderdoc_api.h
+GONE      include/rex/ui/surface.h
+GONE      include/rex/ui/vulkan/api.h
+GONE      include/rex/ui/vulkan/device.h
+GONE      include/rex/ui/vulkan/functions/device_1_0.inc
+GONE      include/rex/ui/vulkan/instance.h
+GONE      include/rex/ui/vulkan/presenter.h
+GONE      resources/templates/init/rexglue_cmake.inja
+GONE      src/audio/CMakeLists.txt
+GONE      src/audio/audio_system.cpp
+GONE      src/audio/sdl/sdl_audio_driver.cpp
+GONE      src/audio/xma_context.cpp
+GONE      src/audio/xma_decoder.cpp
+GONE      src/codegen/builders/builder_context.h
+GONE      src/codegen/builders/context.cpp
+GONE      src/codegen/builders/control_flow.cpp
+GONE      src/codegen/builders/floating_point.cpp
+GONE      src/codegen/builders/helpers.h
+GONE      src/codegen/builders/memory.cpp
+GONE      src/codegen/builders/system.cpp
+GONE      src/codegen/builders/vector.cpp
+GONE      src/codegen/codegen_flags.cpp
+GONE      src/codegen/codegen_flags.h
+GONE      src/core/CMakeLists.txt
+GONE      src/core/clock.cpp
+GONE      src/core/clock_posix.cpp
+GONE      src/core/cvar.cpp
+GONE      src/core/filesystem_posix.cpp
+GONE      src/core/logging.cpp
+GONE      src/core/threading_posix.cpp
+GONE      src/core/timer_queue.cpp
+GONE      src/core/utf8.cpp
+GONE      src/filesystem/devices/host_path_device.cpp
+GONE      src/filesystem/devices/host_path_entry.cpp
+GONE      src/filesystem/devices/host_path_file.cpp
+GONE      src/filesystem/devices/stfs_container_file.cpp
+GONE      src/filesystem/entry.cpp
+GONE      src/filesystem/virtual_file_system.cpp
+GONE      src/graphics/CMakeLists.txt
+GONE      src/graphics/command_processor.cpp
+GONE      src/graphics/pipeline/shader/spirv_translator.cpp
+GONE      src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+GONE      src/graphics/plugin_main.cpp
+GONE      src/graphics/primitive_processor.cpp
+GONE      src/graphics/util/draw.cpp
+GONE      src/graphics/util/draw_extent_estimator.cpp
+GONE      src/graphics/vulkan/command_processor.cpp
+GONE      src/graphics/vulkan/pipeline_cache.cpp
+GONE      src/graphics/vulkan/primitive_processor.cpp
+GONE      src/graphics/vulkan/render_target_cache.cpp
+GONE      src/graphics/vulkan/shared_memory.cpp
+GONE      src/graphics/vulkan/texture_cache.cpp
+GONE      src/input/CMakeLists.txt
+GONE      src/input/input_system.cpp
+GONE      src/input/mnk/mnk_input_driver.cpp
+GONE      src/kernel/xam/xam_content.cpp
+GONE      src/system/CMakeLists.txt
+GONE      src/system/function_dispatcher.cpp
+GONE      src/system/gpu_plugin_loader.cpp
+GONE      src/system/mmio_handler.cpp
+GONE      src/system/runtime.cpp
+GONE      src/system/util/object_table.cpp
+GONE      src/system/xam/content_manager.cpp
+GONE      src/system/xex_module.cpp
+GONE      src/system/xfile.cpp
+GONE      src/system/xmemory.cpp
+GONE      src/system/xobject.cpp
+GONE      src/system/xthread.cpp
+GONE      src/ui/imgui_drawer.cpp
+GONE      src/ui/presenter.cpp
+GONE      src/ui/renderdoc_api.cpp
+GONE      src/ui/rex_app.cpp
+GONE      src/ui/vulkan/vulkan_device.cpp
+GONE      src/ui/vulkan/vulkan_instance.cpp
+GONE      src/ui/vulkan/vulkan_presenter.cpp

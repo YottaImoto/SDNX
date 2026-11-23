@@ -16,13 +16,26 @@
 //       with the running count and bytes (cheap enough to compare a whole boot).
 
 #include <rex/cvar.h>
+#ifdef SDNX_UPSTREAM_SDK
+#include <rex/platform/file.h>
+#include <rex/ppc/hook.h>
+namespace sd_files = rex::platform;
+#else
 #include <rex/filesystem.h>
 #include <rex/hook.h>
+#include <rex/ppc/func.h>
+namespace sd_files = rex::filesystem;
+#endif
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
-#include <rex/ppc/func.h>
 
+#ifdef SDNX_UPSTREAM_SDK
+#include <rex/kernel/function_dispatcher.h>
+using SdnxRegistrar = rex::kernel::IFunctionRegistrar;
+#else
 #include <rex/system/function_dispatcher.h>
+using SdnxRegistrar = rex::runtime::IModuleRegistrar;
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -44,7 +57,7 @@ extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTra
 #include <unwind.h>
 #endif
 
-void sdretail_RegisterFunctions(rex::runtime::IModuleRegistrar* registrar);
+void sdretail_RegisterFunctions(SdnxRegistrar* registrar);
 
 REXCVAR_DEFINE_BOOL(sdretail_alloc_log, false, "Sleeping Dogs",
                     "Log large memory pool requests and running totals (compare runs on PC and console)");
@@ -77,7 +90,7 @@ std::string GuestString(uint8_t* base, uint32_t addr) {
 // each range as "SDNXDUMP" <start u32> <length u32> (little endian) + bytes.
 void DumpPools(uint8_t* base) {
   static const uint32_t kRanges[][2] = {{0xBD9C8000u, 0x44F000u}, {0xB77E1000u, 0x259000u}};
-  const std::string path = (rex::filesystem::GetExecutableFolder() / "scaleform_dump.bin").string();
+  const std::string path = (sd_files::GetExecutableFolder() / "scaleform_dump.bin").string();
   std::FILE* f = std::fopen(path.c_str(), "wb");
   if (!f) {
     REXLOG_ERROR("[alloc] dump: cannot write {}", path);
@@ -98,7 +111,7 @@ void DumpPools(uint8_t* base) {
 // return address is mapped to the registered function that starts at or below it (the table comes from the same
 // registration function the runtime uses). Tail calls (b) leave no frame, and frames outside the game code (SDK,
 // dispatcher) are dropped, so this is the chain of guest functions that called with bl.
-class FunctionTable final : public rex::runtime::IModuleRegistrar {
+class FunctionTable final : public SdnxRegistrar {
  public:
   bool SetFunction(uint32_t guest_address, ::PPCFunc* func) override {
     entries_.emplace_back(reinterpret_cast<uintptr_t>(func), guest_address);

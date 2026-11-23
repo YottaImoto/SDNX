@@ -5,7 +5,7 @@
 #   SUDO_PW=... bash /mnt/d/CODE/SDNX/nx/tools/sd_build_nro.sh        (docker needs sudo here; or be in group docker)
 #
 # Output: ~/masseffect-nx/out/nx-sd/sdretail.nro, copied to D:\CODE\SDNX\nx\sdretail.nro
-# Environment: JOBS (default 4: each job needs 1-2 GB, WSL has ~7 GB), NRO_OUT (default out/nx-sd)
+# Environment: JOBS (default 7: each job needs 1-2 GB; WSL has 12 GB + 8 GB swap since 16.192, %USERPROFILE%/.wslconfig), NRO_OUT (default out/nx-sd)
 set -euo pipefail
 
 ME="$HOME/masseffect-nx"
@@ -19,7 +19,10 @@ if [[ "$GUEST_VOLATILE" == ON ]]; then NRO_OUT="${NRO_OUT:-out/nx-sd-vol}"; else
 # by nx/tools/sd_pgo_merge.sh from ~/masseffect-nx/pgo); each in a build tree of its own.
 SDNX_PGO="${SDNX_PGO:-}"
 if [[ -n "$SDNX_PGO" ]]; then NRO_OUT="${NRO_OUT}-pgo${SDNX_PGO}"; fi
-JOBS="${JOBS:-4}"
+# SDNX 16.196: SDNX_LTO=ON adds link-time optimisation (own build tree, suffix -lto; SDNX_LTO_JOBS LTRANS jobs).
+SDNX_LTO="${SDNX_LTO:-OFF}"; SDNX_LTO_JOBS="${SDNX_LTO_JOBS:-4}"
+if [[ "$SDNX_LTO" == ON ]]; then NRO_OUT="${NRO_OUT}-lto"; fi
+JOBS="${JOBS:-7}"
 DEST=/mnt/d/CODE/SDNX/nx
 
 docker_cmd() {
@@ -34,13 +37,13 @@ docker_cmd() {
 echo "== build $NRO_OUT (-j$JOBS)"
 docker_cmd run --rm -v "$ME:$ME" -v "$MESA:$MESA:ro" -w "$ME" \
   -e ME="$ME" -e MESA="$MESA" -e NRO_OUT="$NRO_OUT" -e JOBS="$JOBS" -e GUEST_VOLATILE="$GUEST_VOLATILE" \
-  -e SDNX_DEKO3D_DEBUG="${SDNX_DEKO3D_DEBUG:-OFF}"   -e SDNX_PGO="$SDNX_PGO" \
+  -e SDNX_DEKO3D_DEBUG="${SDNX_DEKO3D_DEBUG:-OFF}"   -e SDNX_PGO="$SDNX_PGO" -e SDNX_LTO="$SDNX_LTO" -e SDNX_LTO_JOBS="$SDNX_LTO_JOBS" \
   devkitpro/devkita64:latest bash -euo pipefail -c '
     cmake -S sdretail -B "$NRO_OUT" -G Ninja -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$ME/tools/switch/cmake/switch-devkitA64.cmake" \
       -DDEVKITPRO=/opt/devkitpro \
       -DSDRETAIL_GUEST_VOLATILE="$GUEST_VOLATILE" \
-      -DSDNX_DEKO3D_DEBUG="${SDNX_DEKO3D_DEBUG:-OFF}"       -DSDNX_PGO="$SDNX_PGO" -DSDNX_PGO_DIR="$ME/pgo" \
+      -DSDNX_DEKO3D_DEBUG="${SDNX_DEKO3D_DEBUG:-OFF}"       -DSDNX_PGO="$SDNX_PGO" -DSDNX_PGO_DIR="$ME/pgo" -DSDNX_LTO="$SDNX_LTO" -DSDNX_LTO_JOBS="$SDNX_LTO_JOBS" \
       -DREXGLUE_SWITCH_NVK_SDK="$MESA/opt/devkitpro/portlibs/switch" > "$NRO_OUT.configure.log" 2>&1 \
       || { tail -40 "$NRO_OUT.configure.log"; exit 1; }
     cmake --build "$NRO_OUT" -j "$JOBS"
@@ -48,8 +51,9 @@ docker_cmd run --rm -v "$ME:$ME" -v "$MESA:$MESA:ro" -w "$ME" \
     /opt/devkitpro/devkitA64/bin/aarch64-none-elf-nm "$NRO_OUT/sdretail" | grep "^0000000000000000 T _start$" > /dev/null
     echo "OK: _start at 0"
   '
-if [[ -n "$SDNX_PGO" ]]; then
-  cp -f "$ME/$NRO_OUT/sdretail.nro" "$DEST/sdretail_pgo$SDNX_PGO.nro"; ls -la "$DEST/sdretail_pgo$SDNX_PGO.nro"
+if [[ -n "$SDNX_PGO" || "$SDNX_LTO" == ON ]]; then
+  NAME="sdretail"; [[ -n "$SDNX_PGO" ]] && NAME="${NAME}_pgo$SDNX_PGO"; [[ "$SDNX_LTO" == ON ]] && NAME="${NAME}_lto"
+  cp -f "$ME/$NRO_OUT/sdretail.nro" "$DEST/$NAME.nro"; ls -la "$DEST/$NAME.nro"
 else
   cp -f "$ME/$NRO_OUT/sdretail.nro" "$DEST/sdretail.nro"; ls -la "$DEST/sdretail.nro"
 fi

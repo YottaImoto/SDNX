@@ -16,10 +16,14 @@
 
 REXCVAR_DECLARE(bool, sdretail_verify_data);           // sdnx_verify_data.cpp
 void SdnxVerifyData(const std::filesystem::path& root);  // sdnx_verify_data.cpp
+REXCVAR_DECLARE(int32_t, sdretail_handheld_gpu_mhz);   // main.cpp, §16.204
 
 #ifdef __SWITCH__
 // libnx svcGetInfo, declared here: switch.h clashes with the SDK types in this header.
 extern "C" uint32_t svcGetInfo(uint64_t* out, uint32_t id0, uint32_t handle, uint64_t id1);
+// The SDK's Horizon performance profile (src/ui/switch_apm.cpp; masseffect-nx called it, this app never did).
+extern "C" void RexSwitchApmRequestGpuMhz(int mhz);
+extern "C" void RexSwitchApmApply(void);
 #endif
 
 class SdRetailApp : public rex::ReXApp {
@@ -51,6 +55,17 @@ class SdRetailApp : public rex::ReXApp {
         std::fprintf(stderr,
                      "[memory] NOT ENOUGH MEMORY: this is applet mode (hbmenu opened from the album). Start hbmenu "
                      "over a game instead: hold R while launching any installed game.\n");
+      }
+    }
+    // §16.204: the official 460.8 MHz handheld GPU configuration (apm, as commercial games request it; memory stays
+    // at 1331.2 MHz). Without it the handheld GPU ran at 307.2 MHz on stock clocks: 10-13 fps, CPU at 211 % of 300
+    // (§16.204 run). The SDK had the code since masseffect-nx; this app never called it. Docked: nothing is changed
+    // (the docked GPU is 768 MHz). 0 in sdretail.toml = leave the clocks alone, 384 = the middle configuration.
+    {
+      const int32_t mhz = REXCVAR_GET(sdretail_handheld_gpu_mhz);
+      if (mhz > 0) {
+        RexSwitchApmRequestGpuMhz(mhz >= 460 ? 460 : 384);
+        RexSwitchApmApply();
       }
     }
 #endif
