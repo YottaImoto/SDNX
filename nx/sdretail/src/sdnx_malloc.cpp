@@ -14,8 +14,19 @@
 //
 // sdnx_malloc_thread_cache (sdretail.toml, default true) is read at OnInit; before that, and with false, blocks get the
 // header but go straight to newlib.
+//
+// SDNX 16.245 (sdnx_malloc_central, default true): blocks that one thread allocates and another frees. The thread cache
+// alone could not help them: the freeing thread's list filled up (64) and every further free went to newlib, while the
+// allocating thread's list stayed empty and every allocation went to newlib - both under newlib's lock. In the stack
+// profile of 2026-11-25 (16.243, driving) the guest worker threads had ~10 % and the GPU command thread ~13 % of their
+// waits in rmutexLock under _malloc_r / _free_r called from the wait paths, HashedCopy and RexGmProtect. Now a full
+// thread list hands a batch of 32 blocks to a per-class central list and an empty one takes a batch from there, under
+// a spin lock held for a few pointer moves; newlib is reached only when the central list is empty or full (2 MiB of
+// blocks per class).
 
 #if defined(__SWITCH__) && defined(__aarch64__)
+
+#include <switch.h>
 
 #include <atomic>
 #include <cstddef>
@@ -49,6 +60,7 @@ constexpr int kMaxCached = 64;  // blocks per class per thread: at most ~1 MB a 
 
 struct FreeBlock {
   FreeBlock* next;
+  FreeBlock* next_batch;  // 16.245: in the central list, the first block of a batch links the next batch
 };
 
 struct ThreadCache {
@@ -59,6 +71,72 @@ struct ThreadCache {
 thread_local ThreadCache t_cache;
 
 std::atomic<bool> g_cache_on{false};
+
+// 16.245: the central lists.
+constexpr int kBatch = 32;
+constexpr size_t kCentralBytes = 2u << 20;  // per class
+std::atomic<bool> g_central_on{false};
+
+struct Central {
+  std::atomic<bool> lock{false};
+  FreeBlock* batches = nullptr;
+  uint32_t count = 0;  // batches
+};
+Central g_central[kClasses];
+
+inline void CentralLock(Central& c) {
+  for (unsigned spins = 0; c.lock.exchange(true, std::memory_order_acquire);) {
+    while (c.lock.load(std::memory_order_relaxed)) {
+      if (++spins >= 64) {
+        spins = 0;
+        svcSleepThread(0);  // the holder may have been preempted: let it run
+      }
+    }
+  }
+}
+
+inline void CentralUnlock(Central& c) { c.lock.store(false, std::memory_order_release); }
+
+inline uint32_t CentralCap(int cls) {
+  const uint32_t batches = uint32_t(kCentralBytes / (size_t(kClassSize[cls]) + kHeader) / kBatch);
+  return batches < 4 ? 4 : batches;
+}
+
+// The thread list of class c is full: hand its first kBatch blocks to the central list. False if the central list is
+// full too (the caller then frees to newlib as before).
+bool GiveBatch(ThreadCache& tc, int c) {
+  FreeBlock* first = tc.head[c];
+  FreeBlock* last = first;
+  for (int i = 1; i < kBatch; ++i) last = last->next;
+  Central& central = g_central[c];
+  CentralLock(central);
+  if (central.count >= CentralCap(c)) {
+    CentralUnlock(central);
+    return false;
+  }
+  tc.head[c] = last->next;
+  tc.count[c] = uint16_t(tc.count[c] - kBatch);
+  last->next = nullptr;
+  first->next_batch = central.batches;
+  central.batches = first;
+  ++central.count;
+  CentralUnlock(central);
+  return true;
+}
+
+// The thread list of class c is empty: take a batch from the central list.
+FreeBlock* TakeBatch(int c) {
+  Central& central = g_central[c];
+  if (!central.batches) return nullptr;  // racy peek: an empty list is not worth the lock
+  CentralLock(central);
+  FreeBlock* batch = central.batches;
+  if (batch) {
+    central.batches = batch->next_batch;
+    --central.count;
+  }
+  CentralUnlock(central);
+  return batch;
+}
 
 inline int ClassOf(size_t n) {
   for (int c = 0; c < kClasses; ++c) {
@@ -98,6 +176,13 @@ void* Alloc(struct _reent* r, size_t n, size_t align) {
           --tc.count[c];
           return b;  // the header is still in place from the first allocation
         }
+        if (g_central_on.load(std::memory_order_relaxed)) {
+          if (FreeBlock* b = TakeBatch(c)) {  // 16.245
+            tc.head[c] = b->next;
+            tc.count[c] = kBatch - 1;
+            return b;
+          }
+        }
       }
       return AllocFromNewlib(r, kClassSize[c], 16, static_cast<uint32_t>(c));
     }
@@ -115,6 +200,9 @@ void Free(struct _reent* r, void* p) {
   if (h->cls != kBig && g_cache_on.load(std::memory_order_relaxed)) {
     ThreadCache& tc = t_cache;
     const uint32_t c = h->cls;
+    if (tc.count[c] >= kMaxCached && g_central_on.load(std::memory_order_relaxed)) {
+      GiveBatch(tc, int(c));  // 16.245: room again unless the central list is full as well
+    }
     if (tc.count[c] < kMaxCached) {
       FreeBlock* b = static_cast<FreeBlock*>(p);
       b->next = tc.head[c];
@@ -174,8 +262,12 @@ void* __wrap__realloc_r(struct _reent* r, void* p, size_t n) {
 // OnInit: the setting is known and the thread pointers are set up.
 void SdnxMallocThreadCache(bool on) { g_cache_on.store(on, std::memory_order_relaxed); }
 
+// 16.245: the central lists (only with the thread cache on).
+void SdnxMallocCentral(bool on) { g_central_on.store(on, std::memory_order_relaxed); }
+
 }  // extern "C"
 
 #else
 extern "C" void SdnxMallocThreadCache(bool) {}
+extern "C" void SdnxMallocCentral(bool) {}
 #endif

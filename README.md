@@ -22,7 +22,8 @@ The Xbox 360 release of **Sleeping Dogs**, lifted instruction by instruction to 
 > [!WARNING]
 > **Work in progress.** The game boots, plays its videos and runs gameplay on a real console without crashing, now
 > on the current ReXGlue SDK (see [The port to the current ReXGlue](#-the-port-to-the-current-rexglue)), but at
-> ~19–24 fps in handheld gameplay with sys-clk, below the 30 fps target. There is no prebuilt NRO.
+> ~19–27 fps in handheld gameplay with sys-clk (~19–20 while driving through the city), below the 30 fps target.
+> There is no prebuilt NRO.
 
 > [!IMPORTANT]
 > **No game data is included.** You need your own copy of the Xbox 360 disc. The recompiled code, the shader
@@ -55,11 +56,11 @@ The Xbox 360 release of **Sleeping Dogs**, lifted instruction by instruction to 
 | Rendering (console, deko3d) | ✅ Correct picture: lighting, shadows, haze, post-processing. Known glitches: lens flare visible through objects, some UI icons partly garbled, glass shimmering while moving |
 | Rendering (bench, Vulkan) | ✅ Matches the Xenos emulation |
 | Audio | ✅ Works, no delay; decoded XMA frames cached (95 % of requests answered from the cache, checked bit for bit) |
-| Performance | ⚠️ ~19–24 fps in handheld gameplay with sys-clk (target: 30), PGO + LTO build; the GPU (~46 ms a frame) holds the frame |
+| Performance | ⚠️ ~19–27 fps in handheld gameplay with sys-clk (target: 30), PGO + LTO build; 25–27 standing, ~19–20 driving. The GPU now takes 30–35 ms a frame; while driving the three CPU cores the game may use are full (285–299 % of 300 %) |
 | SDK | ✅ Moved to the current ReXGlue (upstream nightly), no Vulkan in the Switch build; saves shared with the older builds |
 | Online | ⚠️ The game asks to sign in to Xbox LIVE (menu badge, social hub, DLC menu); network prompts still to be removed |
 | Branding patch | ⚠️ Text and buttons ready; Xbox LIVE prompts are not covered yet |
-| Exit | ⚠️ Closing the game ends in a system module error (pcv / clock service) |
+| Exit | ⚠️ The clock service (pcv) has aborted twice, out of session memory, while the overclock tools (Horizon OC / hoc-clk) changed the clocks with the game running: once on exit, once while loading. The game only reads the clocks, and since 16.244 holds no session to pcv between reads (`switch_read_clocks = false` disconnects it completely) |
 
 Fixed since the first console builds:
 - the crash after a few minutes in a game worker thread (allocator pool corruption): guest memory accesses are
@@ -94,11 +95,13 @@ What got it there:
   (`nx/tools/hot_no_volatile.py`, list in `nx/sdretail/hot_nonvolatile.txt`), +20–30 % fps; a capped spin in
   `RtlEnterCriticalSection`.
 
-Where the time goes now (the current-SDK build 16.241, handheld, average frame): the GPU takes ~46 ms: the main
-scene pass ~7 ms, depth and stencil extraction ~8 ms (8–9 times a frame), resolve blits ~3 ms, the shadow map
-~1.2 ms, full-screen post-processing passes 0.4–2.1 ms each, ~200 full barriers ~1 ms. On the CPU the GPU command
-thread takes ~56 % of a core (one draw ~8 µs), the game's main thread 43–67 %, Wwise 20–34 %, four worker threads
-~27–34 % each. The table above is from the fork build at stock clocks.
+Where the time goes now (the current-SDK build 16.245, handheld, driving through the city, sys-clk CPU 1785 MHz /
+GPU 921.6 MHz / memory 1600 MHz, sampled stacks): the GPU takes 30–35 ms a frame (the memory clock matters more than
+the GPU clock: 29–33 ms at GPU 768 MHz with memory at 1600 MHz, 35 ms at GPU 998 MHz with memory at 1331 MHz). The
+frame is held by the CPU: of the three cores the game may use, the game's worker threads take ~142 %, its main thread
+~62 %, the GPU command thread ~53 % (4000–5500 draws a frame at 5–9 µs each) and Wwise ~30 %. Five vector-math
+functions of the game (VMX128 matrix code) are ~58 % of the worker threads' time; on the host their hot instructions
+are loads and the byte shuffles of the VMX translation. The table above is from the fork build at stock clocks.
 
 ##  The port to the current ReXGlue
 
@@ -123,11 +126,16 @@ CPU 1963 MHz / GPU 998 MHz):
 | XMA loops whose end lies before the first frame are not looped (16.239, a fix the fork had) | voice lines play to their end; the bus mission no longer stalls |
 | Cache of decoded XMA frames (16.240, after renut_nx_ultimate_base port 134), keyed by the packet bytes themselves | 95 % of decodes answered from the cache, 0 differences in 8125 checks; small CPU gain, Wwise's own mixing dominates its thread |
 | `[vector_math] "native"` for `vrefp` / `vrsqrtefp` (16.241): the ARM reciprocal estimates (FRECPE / FRSQRTE) plus one Newton step, ~16 bits where the Xenon gives 12, instead of a full divide and square root | 1943 call sites; not visible in fps while the GPU holds the frame |
-| Depth extraction reads the depth image through a colour view (16.242, `sdnx_depth_alias`) instead of copying its raw texels to a buffer first; enabled only after a self-test compares both ways bit for bit. Depth written straight to the textures (MRT) again | expected ~5 ms of the 8.2 ms extraction cost a frame; not measured yet |
+| Depth extraction reads the depth image through a colour view (16.242, `sdnx_depth_alias`) instead of copying its raw texels to a buffer first; enabled only after a self-test compares both ways bit for bit | GPU 46 → ~41 ms (handheld), ~37 ms (docked). Depth written straight to the textures (MRT) is off again: with it the shadows of small objects appeared only 3–5 m ahead of the player |
+| Pixel shaders without the texture sign emulation (16.243, `sdnx_zero_signs`): every texture fetch of a translated shader ran a four-channel loop for signed / biased / gamma channels. `nx/deko3d/shaders/build_zero_sign_variants.py` builds a variant of each of the 834 pixel shaders without it (8.7 → 2.7 MB of code, the lighting shader 16 → 3 KB); the renderer binds it only while every sign byte of the draw is 0, so the result is the same bit for bit | GPU ~41 → ~35 ms (handheld): the lighting pass 1.6–1.8 → 1.2 ms, the shadow blur 0.7–0.8 → 0.3 ms; every draw took the variant. Some yellow spots on a shirt disappeared with it |
+| Waits for up to 8 kernel objects keep their lists on the stack (16.245, `thread_wait_no_alloc`), and the per-thread allocation cache hands blocks freed by another thread back through per-class central lists (`sdnx_malloc_central`) | newlib's lock: GPU command thread 14 → 0.8 % of its waits, worker threads ~10 → 0 %; the GPU command thread ~4 ms a frame faster. No fps change: the freed time went to the next lock |
+| Event waits on Horizon's address arbiter back on (`thread_event_address_wait`; it had been turned off while looking for the bus-mission stall, whose cause was the XMA loop above) | the main thread's time on locks 42 → 20 %, the workers' 38 → 23 %; again no fps change: the three cores stay full |
+| `vperm` / `vperm128` on AArch64 as `tbl` + `tbx` (16.246) instead of the SSE form through simde (8 NEON instructions → 5), equal for every control byte (1 024 000 cases on the PC, and a self-test at startup); a single two-register `tbl` was shorter but made the register allocator spill 40–95 % more | the five hottest game functions 8–204 host instructions shorter; not measured on the console yet |
 
-Every one of them has a switch in `sdretail.toml` (the code-generation ones in `perf_overrides.toml`). Next: the GPU,
-~46 ms a frame at 768 MHz: the depth extraction above, then the heaviest full-screen post-processing shaders (six of
-them take ~9–10 ms), each cheaper version behind a switch and checked against the original picture.
+Every one of them has a switch in `sdretail.toml` (the code-generation ones in `perf_overrides.toml`); `vperm` has
+none, since checking a switch in every permute would add a branch to every game function that has one. Next: the CPU
+while driving: the game's vector code (how the VMX registers are kept between instructions), Wwise (~30 % of a core),
+the geometry hashing of the GPU command thread (~12 % of it).
 
 ##  The native renderer
 
@@ -141,7 +149,9 @@ interface (`renderer/include/gpu_backend.h`) execute them:
 - **Shaders ahead of time**: every Xenos shader of the game translated by XenosRecomp (`nx/shaders`) to HLSL, then
   to SPIR-V (DXC) for Vulkan or to DKSH (DXC → SPIRV-Cross → uam, `nx/shaders/tools/dk_build.py`) for deko3d, looked
   up by microcode hash at run time. Vertex fetches with computed indices (manual instancing) read their data in the
-  shader (vertex pulling).
+  shader (vertex pulling). `nx/deko3d/shaders/build_zero_sign_variants.py` adds, next to the package, variants of
+  the pixel shaders without the texture sign emulation (`sdnx_dksh/zs/`, with an index of the installed shaders'
+  sizes and hashes, so a variant is only used with the exact shader it was made from).
 - **EDRAM-lite**: render targets as host images keyed by EDRAM base and pitch in samples, resolves as copies into
   host textures (with the copy's R/B swap and exponent bias), depth and stencil restore, depth-as-color clears,
   optional scaled render targets.
@@ -176,12 +186,15 @@ The profile belongs to that code: regenerate the game code and it has to be take
 ##  Roadmap
 
 1. **Performance to 30 fps** (measured with sys-clk; stock clocks are the floor):
-   - GPU, the limit: cut the emulation overhead (depth extraction, resolve blits, stencil restores, full barriers)
-     without changing the picture, then cheaper equivalents of the costly post-processing shaders;
-   - CPU: a fresh PGO profile for the current code; more guest functions without `volatile`.
+   - CPU, the limit while driving: the VMX translation of the game's vector code, Wwise's mixing, the GPU command
+     thread's per-draw cost and geometry hashing; a fresh PGO profile for the current code; more guest functions
+     without `volatile`;
+   - GPU (30–35 ms): the remaining emulation overhead (resolve blits, stencil restores, full barriers) without
+     changing the picture; depth written straight to the textures (MRT) without losing the small objects' shadows.
 2. **Rendering glitches**: lens flare through objects, garbled UI icons, glass shimmer.
 3. **Offline mode**: hide the Xbox LIVE sign-in prompts and the online badge.
-4. **Exit crash** in the system modules.
+4. **The pcv abort** while the overclock tools change the clocks (most likely not the game's: check with
+   `switch_read_clocks = false`).
 5. **Publish the SDK side** of the port to the current ReXGlue.
 6. Later: DLC with a Russian translation, the Definitive Edition camera, language selection in the settings.
 

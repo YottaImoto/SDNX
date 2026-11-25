@@ -11,10 +11,18 @@ extern "C" void RexSwitchApmRequestGpuMhz(int mhz);
 extern "C" void RexSwitchApmApply();
 extern "C" void RexSwitchMarkOrderlyExit();
 extern "C" void SdnxMallocThreadCache(bool on);
+extern "C" void SdnxMallocCentral(bool on);
 void SdnxVerifyData(const std::filesystem::path&);
 REXCVAR_DECLARE(bool, sdretail_verify_data);
 REXCVAR_DEFINE_BOOL(sdnx_malloc_thread_cache, true, "Sleeping Dogs",
                     "Small host allocations from a per-thread cache, without newlib's process lock (SDNX 16.230)");
+REXCVAR_DEFINE_BOOL(sdnx_malloc_central, true, "Sleeping Dogs",
+                    "Blocks freed by another thread go back through per-class central lists, not newlib (SDNX 16.245)");
+// SDNX 16.246: here and not in the SDK's window_switch.cpp (16.244), which this build does not link.
+extern "C" void RexSwitchPerfReadClocks(int enabled);  // SDK src/ui/switch_perf.cpp
+REXCVAR_DEFINE_BOOL(switch_read_clocks, true, "Sleeping Dogs",
+                    "Read the CPU/GPU/memory clocks (pcv) and temperatures (ptm) once per second for the clocks line of "
+                    "rex_profile.log; each read opens and closes its sessions. false: never connect to them");
 REXCVAR_DEFINE_INT32(sdretail_handheld_gpu_mhz, 460, "Sleeping Dogs", "Handheld GPU profile (0, 384 or 460 MHz)");
 
 class SleepingDogsApp final : public rex::app::TitleApp {
@@ -39,6 +47,8 @@ class SleepingDogsApp final : public rex::app::TitleApp {
   }
 
   rex::Result<void> OnInit() override {
+    RexSwitchPerfReadClocks(REXCVAR_GET(switch_read_clocks) ? 1 : 0);
+    SdnxMallocCentral(REXCVAR_GET(sdnx_malloc_central));
     SdnxMallocThreadCache(REXCVAR_GET(sdnx_malloc_thread_cache));
     const int mhz = REXCVAR_GET(sdretail_handheld_gpu_mhz);
     if (mhz > 0) {

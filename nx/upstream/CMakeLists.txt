@@ -95,5 +95,5 @@ if(SDNX_LTO)
   message(STATUS "SDNX: LTO (${SDNX_LTO_JOBS} LTRANS jobs)")
 endif()
 
-rexglue_switch_add_nro(sdretail NAME "Sleeping Dogs" AUTHOR "SDNX" VERSION "16.242"
+rexglue_switch_add_nro(sdretail NAME "Sleeping Dogs" AUTHOR "SDNX" VERSION "16.246"
                        ICON "${CMAKE_CURRENT_LIST_DIR}/../sdretail/icon.jpg")
