@@ -11,7 +11,8 @@
 # merge-stream ADDS to existing .gcda files, so this stops when the folder already has some (move them aside).
 # One training session = one stream; several only with --all (sessions of the SAME instrumented build).
 set -euo pipefail
-ME="$HOME/masseffect-nx"
+# SDNX 16.235: SDNX_PGO_HOME=$HOME/sdnx-next for the build on the current ReXGlue (nx/upstream).
+ME="${SDNX_PGO_HOME:-$HOME/masseffect-nx}"
 OUT="$ME/pgo"
 SRC="${1:?folder with sdnx_pgo_*.stream}"
 ALL="${2:-}"

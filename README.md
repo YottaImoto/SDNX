@@ -22,7 +22,7 @@ The Xbox 360 release of **Sleeping Dogs**, lifted instruction by instruction to 
 > [!WARNING]
 > **Work in progress.** The game boots, plays its videos and runs gameplay on a real console without crashing, now
 > on the current ReXGlue SDK (see [The port to the current ReXGlue](#-the-port-to-the-current-rexglue)), but at
-> ~16–19 fps in handheld gameplay, below the 30 fps target. There is no prebuilt NRO.
+> ~19–24 fps in handheld gameplay with sys-clk, below the 30 fps target. There is no prebuilt NRO.
 
 > [!IMPORTANT]
 > **No game data is included.** You need your own copy of the Xbox 360 disc. The recompiled code, the shader
@@ -51,11 +51,11 @@ The Xbox 360 release of **Sleeping Dogs**, lifted instruction by instruction to 
 | Area | State |
 | --- | --- |
 | Boot, menus, intro videos | ✅ Work on the console |
-| Gameplay | ✅ Runs on the console; 17.5 minutes without a crash in the last test, including returns to the main menu and "Continue" |
+| Gameplay | ✅ Runs on the console; 28 minutes without a crash in the longest recent test, including returns to the main menu and "Continue". Winston's bus mission stalled after the night-market drop-off (a voice line that never finished, see below); fixed in 16.239 |
 | Rendering (console, deko3d) | ✅ Correct picture: lighting, shadows, haze, post-processing. Known glitches: lens flare visible through objects, some UI icons partly garbled, glass shimmering while moving |
 | Rendering (bench, Vulkan) | ✅ Matches the Xenos emulation |
-| Audio | ✅ Works, no delay |
-| Performance | ⚠️ ~16–19 fps in handheld gameplay with sys-clk (target: 30); since LTO the GPU (~50 ms a frame) holds the frame |
+| Audio | ✅ Works, no delay; decoded XMA frames cached (95 % of requests answered from the cache, checked bit for bit) |
+| Performance | ⚠️ ~19–24 fps in handheld gameplay with sys-clk (target: 30), PGO + LTO build; the GPU (~46 ms a frame) holds the frame |
 | SDK | ✅ Moved to the current ReXGlue (upstream nightly), no Vulkan in the Switch build; saves shared with the older builds |
 | Online | ⚠️ The game asks to sign in to Xbox LIVE (menu badge, social hub, DLC menu); network prompts still to be removed |
 | Branding patch | ⚠️ Text and buttons ready; Xbox LIVE prompts are not covered yet |
@@ -94,10 +94,11 @@ What got it there:
   (`nx/tools/hot_no_volatile.py`, list in `nx/sdretail/hot_nonvolatile.txt`), +20–30 % fps; a capped spin in
   `RtlEnterCriticalSection`.
 
-Where the time goes now (handheld, average frame): the GPU takes 39–65 ms (~57 ms): scene ~10 ms, lighting ~8,
-post-processing ~7, half-resolution effects ~4, final image with UI ~2, and ~14 ms of emulation overhead (depth
-extraction, color blits for resolves, full barriers, copies). On the CPU the GPU command thread takes ~50 % of a
-core, the game's main thread ~38 %, Wwise ~17 %, four worker threads ~24 % each.
+Where the time goes now (the current-SDK build 16.241, handheld, average frame): the GPU takes ~46 ms: the main
+scene pass ~7 ms, depth and stencil extraction ~8 ms (8–9 times a frame), resolve blits ~3 ms, the shadow map
+~1.2 ms, full-screen post-processing passes 0.4–2.1 ms each, ~200 full barriers ~1 ms. On the CPU the GPU command
+thread takes ~56 % of a core (one draw ~8 µs), the game's main thread 43–67 %, Wwise 20–34 %, four worker threads
+~27–34 % each. The table above is from the fork build at stock clocks.
 
 ##  The port to the current ReXGlue
 
@@ -117,10 +118,16 @@ CPU 1963 MHz / GPU 998 MHz):
 | Per-thread cache in front of newlib's allocator (`nx/sdretail/src/sdnx_malloc.cpp`, `--wrap`) | the GPU command thread no longer waits on the process-wide malloc lock (31 % of its samples); one draw 9–12 → ~5–7 µs |
 | Game code at `-O3`, then **LTO** of the game code, the app and the SDK (`SDNX_LTO`, its own build tree via `REXGLUE_OUTPUT_SUFFIX`) | one draw ~5 µs as in the fork; the GPU command thread stops waiting for the game |
 | Threads wait on Horizon's address arbiter, XMA kicks without the context lock (renut_nx_ultimate_base ports 65 and 120) | fewer wake-up stalls between game threads and audio |
-| Resolve clears only within the resolve rectangle, unchanged resolves skipped (16.233, not measured yet) | GPU: the EDRAM-height (2048-row) targets were cleared whole for a ~720-row frame |
+| Resolve clears only within the resolve rectangle (16.233) | GPU 53 → ~44 ms a frame: the EDRAM-height (2048-row) targets had been cleared whole for a ~720-row frame |
+| **PGO** on top of LTO (16.235–16.236): the game code, the app and the SDK modules (now including the SDK's object libraries) profiled in a 28-minute session on the console, then rebuilt with the profile (`SDNX_PGO=generate\|use`) | 17–20 → 19–24 fps; the frame is held by the GPU again |
+| XMA loops whose end lies before the first frame are not looped (16.239, a fix the fork had) | voice lines play to their end; the bus mission no longer stalls |
+| Cache of decoded XMA frames (16.240, after renut_nx_ultimate_base port 134), keyed by the packet bytes themselves | 95 % of decodes answered from the cache, 0 differences in 8125 checks; small CPU gain, Wwise's own mixing dominates its thread |
+| `[vector_math] "native"` for `vrefp` / `vrsqrtefp` (16.241): the ARM reciprocal estimates (FRECPE / FRSQRTE) plus one Newton step, ~16 bits where the Xenon gives 12, instead of a full divide and square root | 1943 call sites; not visible in fps while the GPU holds the frame |
+| Depth extraction reads the depth image through a colour view (16.242, `sdnx_depth_alias`) instead of copying its raw texels to a buffer first; enabled only after a self-test compares both ways bit for bit. Depth written straight to the textures (MRT) again | expected ~5 ms of the 8.2 ms extraction cost a frame; not measured yet |
 
-Every one of them has a switch in `sdretail.toml`. Next: the GPU (~15 ms of the ~50 ms frame is emulation overhead:
-depth extraction, resolve blits, barriers), then PGO.
+Every one of them has a switch in `sdretail.toml` (the code-generation ones in `perf_overrides.toml`). Next: the GPU,
+~46 ms a frame at 768 MHz: the depth extraction above, then the heaviest full-screen post-processing shaders (six of
+them take ~9–10 ms), each cheaper version behind a switch and checked against the original picture.
 
 ##  The native renderer
 
@@ -161,13 +168,17 @@ Not packaged for others yet; the steps are written down for this machine in [doc
 
 The current-SDK build: `nx/upstream/` is added to the Switch SDK's CMake tree as its title directory
 (`REXGLUE_SWITCH_TITLE_DIR`); `-DSDNX_LTO=ON -DREXGLUE_OUTPUT_SUFFIX=-lto` gives the LTO build in a tree of its own.
+For PGO: build with `-DSDNX_PGO=generate` (its own tree), play on the console (the counts are written every 2 minutes
+to `pgo/sdnx_pgo_<N>.stream` next to the NRO), turn the stream into `.gcda` files with
+`SDNX_PGO_HOME=$HOME/sdnx-next nx/tools/sd_pgo_merge.sh <folder>`, then build with `-DSDNX_PGO=use -DSDNX_LTO=ON`.
+The profile belongs to that code: regenerate the game code and it has to be taken again.
 
 ##  Roadmap
 
 1. **Performance to 30 fps** (measured with sys-clk; stock clocks are the floor):
-   - GPU, the limit since LTO: cut the emulation overhead (depth extraction, resolve blits, full barriers) without
-     changing the picture, then the costly passes;
-   - CPU: PGO on top of LTO; more guest functions without `volatile`.
+   - GPU, the limit: cut the emulation overhead (depth extraction, resolve blits, stencil restores, full barriers)
+     without changing the picture, then cheaper equivalents of the costly post-processing shaders;
+   - CPU: a fresh PGO profile for the current code; more guest functions without `volatile`.
 2. **Rendering glitches**: lens flare through objects, garbled UI icons, glass shimmer.
 3. **Offline mode**: hide the Xbox LIVE sign-in prompts and the online badge.
 4. **Exit crash** in the system modules.

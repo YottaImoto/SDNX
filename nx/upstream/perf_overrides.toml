@@ -50,6 +50,8 @@ vmaddfp = "fused"
 vnmsubfp = "fused"
 vmsum3fp128 = "fused"
 vmsum4fp128 = "fused"
+vrefp = "native"      # SDNX 16.241: FRECPE + one Newton step
+vrsqrtefp = "native"  # SDNX 16.241: FRSQRTE + one Newton step
 
 [functions]
 "0x82C0AAA4" = { share_registers = true }

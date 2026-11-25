@@ -12,8 +12,15 @@
 
 #if defined(SDNX_PGO_GENERATE)
 
+#ifdef SDNX_UPSTREAM_SDK  // the build on the current ReXGlue (nx/upstream)
+#include <rex/logging.h>
+#include <rex/platform/file.h>
+#define SDNX_PGO_EXE_FOLDER() rex::platform::GetExecutableFolder()
+#else
 #include <rex/filesystem.h>
 #include <rex/logging.h>
+#define SDNX_PGO_EXE_FOLDER() rex::filesystem::GetExecutableFolder()
+#endif
 
 #include <chrono>
 #include <cstdio>
@@ -58,7 +65,7 @@ void* Allocate(unsigned length, void* arg) {
 }
 
 std::filesystem::path PickFile() {
-  const std::filesystem::path folder = rex::filesystem::GetExecutableFolder() / "pgo";
+  const std::filesystem::path folder = SDNX_PGO_EXE_FOLDER() / "pgo";
   std::error_code ec;
   std::filesystem::create_directories(folder, ec);
   for (int n = 1; n < 10000; ++n) {
