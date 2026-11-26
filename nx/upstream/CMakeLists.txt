@@ -17,7 +17,9 @@ set(sdnx_common "${CMAKE_CURRENT_LIST_DIR}/../sdretail/src")
 target_sources(sdretail PRIVATE "${sdnx_common}/sdnx_perf_hooks.cpp" "${sdnx_common}/sdnx_fps_limit.cpp"
     "${sdnx_common}/sdnx_alloc_trace.cpp" "${sdnx_common}/sdnx_verify_data.cpp" "${sdnx_common}/sdnx_memset.cpp"
     "${sdnx_common}/sdnx_malloc.cpp" "${sdnx_common}/sdnx_pgo.cpp" "${sdnx_common}/sdnx_world_density.cpp"
-    "${sdnx_common}/sdnx_fog_interval.cpp")
+    "${sdnx_common}/sdnx_fog_interval.cpp" "${sdnx_common}/sdnx_vehicle_skin_cache.cpp"
+    "${sdnx_common}/sdnx_cull_profile.cpp")
+target_link_libraries(sdretail PRIVATE xxHash::xxhash)  # sdnx_vehicle_skin_cache.cpp
 target_compile_definitions(sdretail PRIVATE SDNX_UPSTREAM_SDK=1)
 target_link_options(sdretail PRIVATE LINKER:--wrap=memset
     LINKER:--wrap=_malloc_r,--wrap=_free_r,--wrap=_realloc_r,--wrap=_calloc_r,--wrap=_memalign_r,--wrap=_malloc_usable_size_r)
@@ -96,5 +98,5 @@ if(SDNX_LTO)
   message(STATUS "SDNX: LTO (${SDNX_LTO_JOBS} LTRANS jobs)")
 endif()
 
-rexglue_switch_add_nro(sdretail NAME "Sleeping Dogs" AUTHOR "SDNX" VERSION "16.255"
+rexglue_switch_add_nro(sdretail NAME "Sleeping Dogs" AUTHOR "SDNX" VERSION "16.258"
                        ICON "${CMAKE_CURRENT_LIST_DIR}/../sdretail/icon.jpg")

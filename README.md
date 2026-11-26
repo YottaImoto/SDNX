@@ -102,8 +102,10 @@ held by the CPU: of the three cores the game may use, the game's worker threads 
 the GPU command thread ~58 % (~4600 draws a frame at ~4.6 µs each) and Wwise ~27 %. The hottest game functions are
 jobs of the engine, named in its task descriptors: `UpdateFogTask` (the fog volume, computed on the CPU every frame,
 ~11 % of all game-thread time), `CullManager_CullBucketTask` (visibility, ~10 %) and the CPU skinning of the cars
-with their damage (`SkinVehicleBufferTask`, `MorphSkinDamageBufferTask`, `SkinDamageBufferTask`, ~15 %). The table
-above is from the fork build at stock clocks.
+with their damage (`SkinVehicleBufferTask`, `MorphSkinDamageBufferTask`, `SkinDamageBufferTask`, ~15 %). The
+visibility jobs run once per view: measured per view (16.257, `sdretail_cull_profile`) they take ~25 % of a core while
+driving, a third for the camera (8–9 %) and two thirds for the three shadow cascades (5 / 5 / 6.5 %). The table above
+is from the fork build at stock clocks.
 
 ##  The port to the current ReXGlue
 
@@ -137,11 +139,15 @@ CPU 1963 MHz / GPU 998 MHz):
 | The game's `memcpy` and `memset` (XDK library VMX loops) done by the host's (16.251, `sdretail_native_memcpy`, `nx/sdretail/src/sdnx_perf_hooks.cpp`); the originals still run for overlapping ranges and ranges that cross into the physical view | ~2.5 → ~0.7 % of a core |
 | A fresh PGO profile for the current code (16.253) | within noise: the profile had little left to find |
 | Fewer ambient pedestrians and traffic cars (16.254, `sdretail_ped_density` / `sdretail_traffic_density`, `nx/sdretail/src/sdnx_world_density.cpp`): the game's own caps (45 pedestrians standing, 35 at speed, 22 cars) and the pedestrian spawn density × the factor, 0.75 by default (34 / 26 pedestrians, 17 cars); scripts that clear the streets still work | driving 20.7 → 21.5 fps, the worker threads' time per frame −4 % |
-| The fog volume every 2nd frame (16.255, `sdretail_fog_update_interval`, `nx/sdretail/src/sdnx_fog_interval.cpp`): `UpdateFogTask` fills a 256 KB volume texture on the CPU (32 slices, an `exp` per texel); in the frames in between its jobs return at once and the texture keeps the previous result (skipped only while the texture address stays the same) | expected ~5 % of the game threads' time; not measured on the console yet |
+| The fog volume every 2nd frame (16.255, `sdretail_fog_update_interval`, `nx/sdretail/src/sdnx_fog_interval.cpp`): `UpdateFogTask` fills a 256 KB volume texture on the CPU (32 slices, an `exp` per texel); in the frames in between its jobs return at once and the texture keeps the previous result (skipped only while the texture address stays the same). Since 16.256 `0` computes it only once for each new fog texture (in practice when the world loads), and it no longer follows the time of day or the camera | driving 21.5 → 22.8 fps, the worker threads' time per frame −9 %; `UpdateFogTask` 10.7 → 5.4 % of the game threads at 2, ~0 at 0 |
+| CPU car skinning reused when nothing it reads changed (16.256, `sdretail_vehicle_skin_cache`, `nx/sdretail/src/sdnx_vehicle_skin_cache.cpp`): without a damage decal request the job writes only its output vertices, so all of its inputs (bones through the remap, three vertex streams, a per-bone table) are hashed and the vertices kept from the last identical skinning are copied; a sampled byte-for-byte check (`sdretail_vehicle_skin_verify`) | correct (0 differences) but under 1 % reuse: the inputs change every frame even for parked cars. Off |
+| Smaller shadow casters dropped (16.258, `sdretail_cull_min_size_shadow`, `_camera`, `nx/sdretail/src/sdnx_cull_profile.cpp`): each view's minimum projected size (an object below it is not drawn) × a factor. The shadow cascades keep objects 2–3× smaller than the camera does (0.03–0.05 against 0.1); 2.0 by default for the shadows | fewer shadow draws (small objects far away cast no shadow); not measured on the console yet |
+| Player mode (16.258, `sdretail_quiet`): after startup no log lines, no `rex_profile.log` reports and no stack sampling (the overlays keep fps and resolution), the title's measurements off | for testing the game as a player runs it |
 
 Every one of them has a switch in `sdretail.toml` (the code-generation ones in `perf_overrides.toml`); `vperm` has
 none, since checking a switch in every permute would add a branch to every game function that has one. Next: the
-CPU skinning of the cars (~15 % of the game threads), the visibility jobs, the GPU command thread's per-draw cost.
+shadow cascades (their visibility jobs and draws), the remaining skinning jobs, a few unnamed hot game functions, the
+GPU command thread's per-draw cost.
 
 ##  The native renderer
 
@@ -192,7 +198,7 @@ The profile belongs to that code: regenerate the game code and it has to be take
 ##  Roadmap
 
 1. **Performance to 30 fps** (measured with sys-clk; stock clocks are the floor):
-   - CPU, the limit while driving: the engine's jobs (car skinning, visibility, fog), Wwise's mixing, the GPU
+   - CPU, the limit while driving: the engine's jobs (shadow-cascade visibility, skinning), Wwise's mixing, the GPU
      command thread's per-draw cost; more guest functions without `volatile`;
    - GPU (30–35 ms): the remaining emulation overhead (resolve blits, stencil restores, full barriers) without
      changing the picture; depth written straight to the textures (MRT) without losing the small objects' shadows.

@@ -13,6 +13,8 @@
 // at once, so the texture keeps the previous computation (a fog lag of N-1 frames when the camera turns), and its
 // pages are not written (the GPU thread does not reload it either). A frame is skipped only when its texture address
 // is the one last computed: a new or moved texture is always computed first.
+// 16.256: N = 0 computes the volume only for a new texture (in practice once, when the world loads); after that the
+// fog keeps that first computation (its colour and density do not follow the time of day or the camera). Up to 60.
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -23,7 +25,8 @@
 #include <cstring>
 
 REXCVAR_DEFINE_INT32(sdretail_fog_update_interval, 1, "Sleeping Dogs",
-                     "The fog volume (UpdateFogTask) computed every Nth frame (SDNX 16.255; 1 = every frame, 1-4)");
+                     "The fog volume (UpdateFogTask) computed every Nth frame (SDNX 16.255; 1 = every frame, "
+                     "0 = only once for each new fog texture, 0-60)");
 
 REX_EXTERN(__imp__sub_822B1228);
 REX_EXTERN(__imp__sub_826F1D68);
@@ -39,7 +42,7 @@ uint32_t LoadU32(const uint8_t* base, uint32_t address) {
 int Interval() {
   static const int n = [] {
     const int v = REXCVAR_GET(sdretail_fog_update_interval);
-    return v < 1 ? 1 : v > 4 ? 4 : v;
+    return v < 0 ? 1 : v > 60 ? 60 : v;
   }();
   return n;
 }
@@ -53,9 +56,9 @@ std::atomic<bool> g_logged_first{false};
 }  // namespace
 
 REX_HOOK_RAW(sub_822B1228) {
-  if (Interval() > 1) {
+  if (Interval() != 1) {
     const uint64_t n = g_starts.fetch_add(1, std::memory_order_relaxed) + 1;
-    g_skip.store(n % uint64_t(Interval()) != 0, std::memory_order_release);
+    g_skip.store(Interval() == 0 || n % uint64_t(Interval()) != 0, std::memory_order_release);
     if ((n & 4095) == 0) {
       REXLOG_INFO("[sdnx_fog] {} fog updates started: jobs computed {}, skipped {}; texture address changes {}", n,
                   g_jobs_run.load(std::memory_order_relaxed), g_jobs_skipped.load(std::memory_order_relaxed),
@@ -73,7 +76,7 @@ REX_HOOK_RAW(sub_826F1D68) {
   const uint32_t task = ctx.r5.u32;
   const uint32_t out = LoadU32(base, task + 24);
   if (!g_logged_first.exchange(true, std::memory_order_relaxed)) {
-    REXLOG_INFO("[sdnx_fog] fog volume every {} frames: texture {:#010x}, {} slices, counter {:#010x}", Interval(), out,
+    REXLOG_INFO("[sdnx_fog] fog volume every {} frames (0: once per texture): texture {:#010x}, {} slices, counter {:#010x}", Interval(), out,
                 LoadU32(base, task + 52), LoadU32(base, task + 32));
   }
   if (g_skip.load(std::memory_order_acquire) && out != 0 && out == g_last_out.load(std::memory_order_acquire)) {
