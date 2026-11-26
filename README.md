@@ -74,9 +74,24 @@ Fixed since the first console builds:
 
 ##  Performance
 
-Handheld, stock clocks (no overclocking), 75 % render scale, frame limit 30:
+The current-SDK build on the console, handheld, sys-clk CPU 1785 MHz / GPU 921.6 MHz / memory 1600 MHz, 75 % render
+scale, frame limit 30, averages over 10-second windows of the profile (driving: through the city, ~4600 draws a
+frame; the routes are similar, not identical):
 
-| Scene | Draws per frame | fps (0.1.0, Vulkan/NVK) | fps (now, deko3d) |
+| Build | What changed | On foot | Driving | Worker threads per frame (% of a core) |
+| --- | --- | --- | --- | --- |
+| 16.248 | VMX registers v0–v13 as locals | — | 20.9 | 6.67 |
+| 16.253 | the game's memcpy / memset native, a fresh PGO profile | — | 20.7 | 6.70 |
+| 16.254 | pedestrians and traffic × 0.75 | 26.4 | 21.5 | 6.42 |
+| 16.255 | the fog volume every 2nd frame | 27.6 | 22.8 | 5.82 |
+
+30 fps in some places on foot. While driving the GPU takes ~31 ms of the 33 a 30-fps frame allows, and the frame
+(~43 ms) is held by the CPU (290–299 % of the three cores the game may use). 16.256–16.258 (fog computed once, smaller
+shadow casters dropped) are not measured yet.
+
+The fork build (SDK 0.10), stock clocks (no overclocking), the same render scale and frame limit:
+
+| Scene | Draws per frame | fps (0.1.0, Vulkan/NVK) | fps (fork, deko3d) |
 | --- | --- | --- | --- |
 | Light scenes | < 1500 | — | 18.5 |
 | Medium | 1500–2500 | 9 (cutscene) | 17.3 |
@@ -104,8 +119,7 @@ jobs of the engine, named in its task descriptors: `UpdateFogTask` (the fog volu
 ~11 % of all game-thread time), `CullManager_CullBucketTask` (visibility, ~10 %) and the CPU skinning of the cars
 with their damage (`SkinVehicleBufferTask`, `MorphSkinDamageBufferTask`, `SkinDamageBufferTask`, ~15 %). The
 visibility jobs run once per view: measured per view (16.257, `sdretail_cull_profile`) they take ~25 % of a core while
-driving, a third for the camera (8–9 %) and two thirds for the three shadow cascades (5 / 5 / 6.5 %). The table above
-is from the fork build at stock clocks.
+driving, a third for the camera (8–9 %) and two thirds for the three shadow cascades (5 / 5 / 6.5 %).
 
 ##  The port to the current ReXGlue
 
