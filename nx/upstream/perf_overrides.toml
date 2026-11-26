@@ -11,8 +11,11 @@ xer_as_local = true
 ctr_as_local = true
 non_argument_as_local = true
 
-# Arguments in registers: off (no gain on top of the locals in masseffect-nx, needs a console run).
-args_in_registers = false
+# SDNX 16.247: the volatile vector registers v0-v13 (arguments and results) as locals inside a function, stored to
+# ctx before every call and return and loaded back after calls ("off", "leaf" = only functions without calls, "all").
+# The stack profile of 2026-11-25 had ~20 % of the host instructions of the game's hottest vector functions storing
+# and reloading ctx.v0-v13. (The old key args_in_registers of masseffect-nx does not exist in this SDK.)
+vector_args_as_local = "all"
 
 # No mfmsr/mtmsrd fences, ctx.msr stores or global lock around the guest atomic sequences; reservation in a local.
 # Checked on the Sleeping Dogs code (2026-11-08): all 1121 REX_ENTER_GLOBAL_LOCK brackets surround exactly one

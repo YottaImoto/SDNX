@@ -1918,3 +1918,5 @@ sub_821B8DD0
 sub_82E374D8
 sub_82B81BC8
 sub_82B5D6E0
+# SDNX 16.252: the hottest worker function while driving (7.8 % of guest time in the 16.251 profile) was missing; spin_check: 9 loops, 0 risky.
+sub_826E58C8

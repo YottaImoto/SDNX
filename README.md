@@ -56,7 +56,7 @@ The Xbox 360 release of **Sleeping Dogs**, lifted instruction by instruction to 
 | Rendering (console, deko3d) | ✅ Correct picture: lighting, shadows, haze, post-processing. Known glitches: lens flare visible through objects, some UI icons partly garbled, glass shimmering while moving |
 | Rendering (bench, Vulkan) | ✅ Matches the Xenos emulation |
 | Audio | ✅ Works, no delay; decoded XMA frames cached (95 % of requests answered from the cache, checked bit for bit) |
-| Performance | ⚠️ ~19–27 fps in handheld gameplay with sys-clk (target: 30), PGO + LTO build; 25–27 standing, ~19–20 driving. The GPU now takes 30–35 ms a frame; while driving the three CPU cores the game may use are full (285–299 % of 300 %) |
+| Performance | ⚠️ ~20–30 fps in handheld gameplay with sys-clk (target: 30), PGO + LTO build; 26–27 on foot (30 in some places), ~21–22 driving. The GPU takes ~30 ms a frame; while driving the three CPU cores the game may use are full (290–299 % of 300 %) |
 | SDK | ✅ Moved to the current ReXGlue (upstream nightly), no Vulkan in the Switch build; saves shared with the older builds |
 | Online | ⚠️ The game asks to sign in to Xbox LIVE (menu badge, social hub, DLC menu); network prompts still to be removed |
 | Branding patch | ⚠️ Text and buttons ready; Xbox LIVE prompts are not covered yet |
@@ -95,13 +95,15 @@ What got it there:
   (`nx/tools/hot_no_volatile.py`, list in `nx/sdretail/hot_nonvolatile.txt`), +20–30 % fps; a capped spin in
   `RtlEnterCriticalSection`.
 
-Where the time goes now (the current-SDK build 16.245, handheld, driving through the city, sys-clk CPU 1785 MHz /
-GPU 921.6 MHz / memory 1600 MHz, sampled stacks): the GPU takes 30–35 ms a frame (the memory clock matters more than
-the GPU clock: 29–33 ms at GPU 768 MHz with memory at 1600 MHz, 35 ms at GPU 998 MHz with memory at 1331 MHz). The
-frame is held by the CPU: of the three cores the game may use, the game's worker threads take ~142 %, its main thread
-~62 %, the GPU command thread ~53 % (4000–5500 draws a frame at 5–9 µs each) and Wwise ~30 %. Five vector-math
-functions of the game (VMX128 matrix code) are ~58 % of the worker threads' time; on the host their hot instructions
-are loads and the byte shuffles of the VMX translation. The table above is from the fork build at stock clocks.
+Where the time goes now (the current-SDK build 16.254, handheld, driving through the city, sys-clk CPU 1785 MHz /
+GPU 921.6 MHz / memory 1600 MHz): the GPU takes ~30 ms a frame (the memory clock matters more than the GPU clock:
+29–33 ms at GPU 768 MHz with memory at 1600 MHz, 35 ms at GPU 998 MHz with memory at 1331 MHz). The frame (~46 ms) is
+held by the CPU: of the three cores the game may use, the game's worker threads take ~138 %, its main thread ~62 %,
+the GPU command thread ~58 % (~4600 draws a frame at ~4.6 µs each) and Wwise ~27 %. The hottest game functions are
+jobs of the engine, named in its task descriptors: `UpdateFogTask` (the fog volume, computed on the CPU every frame,
+~11 % of all game-thread time), `CullManager_CullBucketTask` (visibility, ~10 %) and the CPU skinning of the cars
+with their damage (`SkinVehicleBufferTask`, `MorphSkinDamageBufferTask`, `SkinDamageBufferTask`, ~15 %). The table
+above is from the fork build at stock clocks.
 
 ##  The port to the current ReXGlue
 
@@ -130,12 +132,16 @@ CPU 1963 MHz / GPU 998 MHz):
 | Pixel shaders without the texture sign emulation (16.243, `sdnx_zero_signs`): every texture fetch of a translated shader ran a four-channel loop for signed / biased / gamma channels. `nx/deko3d/shaders/build_zero_sign_variants.py` builds a variant of each of the 834 pixel shaders without it (8.7 → 2.7 MB of code, the lighting shader 16 → 3 KB); the renderer binds it only while every sign byte of the draw is 0, so the result is the same bit for bit | GPU ~41 → ~35 ms (handheld): the lighting pass 1.6–1.8 → 1.2 ms, the shadow blur 0.7–0.8 → 0.3 ms; every draw took the variant. Some yellow spots on a shirt disappeared with it |
 | Waits for up to 8 kernel objects keep their lists on the stack (16.245, `thread_wait_no_alloc`), and the per-thread allocation cache hands blocks freed by another thread back through per-class central lists (`sdnx_malloc_central`) | newlib's lock: GPU command thread 14 → 0.8 % of its waits, worker threads ~10 → 0 %; the GPU command thread ~4 ms a frame faster. No fps change: the freed time went to the next lock |
 | Event waits on Horizon's address arbiter back on (`thread_event_address_wait`; it had been turned off while looking for the bus-mission stall, whose cause was the XMA loop above) | the main thread's time on locks 42 → 20 %, the workers' 38 → 23 %; again no fps change: the three cores stay full |
-| `vperm` / `vperm128` on AArch64 as `tbl` + `tbx` (16.246) instead of the SSE form through simde (8 NEON instructions → 5), equal for every control byte (1 024 000 cases on the PC, and a self-test at startup); a single two-register `tbl` was shorter but made the register allocator spill 40–95 % more | the five hottest game functions 8–204 host instructions shorter; not measured on the console yet |
+| `vperm` / `vperm128` on AArch64 as `tbl` + `tbx` (16.246) instead of the SSE form through simde (8 NEON instructions → 5), equal for every control byte (1 024 000 cases on the PC, and a self-test at startup); a single two-register `tbl` was shorter but made the register allocator spill 40–95 % more | the five hottest game functions 8–204 host instructions shorter |
+| VMX registers v0–v13 as locals inside each recompiled function (16.247–16.248, `vector_args_as_local` in `perf_overrides.toml`): loaded from the context on entry, written back only around calls and returns, and around each call only the registers the callee (transitively) uses (`nx/tools/vargs_call_sync.py`) | loads and stores of vector registers in the hot functions down by 10–35 %; the worker threads' time per frame −8 % |
+| The game's `memcpy` and `memset` (XDK library VMX loops) done by the host's (16.251, `sdretail_native_memcpy`, `nx/sdretail/src/sdnx_perf_hooks.cpp`); the originals still run for overlapping ranges and ranges that cross into the physical view | ~2.5 → ~0.7 % of a core |
+| A fresh PGO profile for the current code (16.253) | within noise: the profile had little left to find |
+| Fewer ambient pedestrians and traffic cars (16.254, `sdretail_ped_density` / `sdretail_traffic_density`, `nx/sdretail/src/sdnx_world_density.cpp`): the game's own caps (45 pedestrians standing, 35 at speed, 22 cars) and the pedestrian spawn density × the factor, 0.75 by default (34 / 26 pedestrians, 17 cars); scripts that clear the streets still work | driving 20.7 → 21.5 fps, the worker threads' time per frame −4 % |
+| The fog volume every 2nd frame (16.255, `sdretail_fog_update_interval`, `nx/sdretail/src/sdnx_fog_interval.cpp`): `UpdateFogTask` fills a 256 KB volume texture on the CPU (32 slices, an `exp` per texel); in the frames in between its jobs return at once and the texture keeps the previous result (skipped only while the texture address stays the same) | expected ~5 % of the game threads' time; not measured on the console yet |
 
 Every one of them has a switch in `sdretail.toml` (the code-generation ones in `perf_overrides.toml`); `vperm` has
-none, since checking a switch in every permute would add a branch to every game function that has one. Next: the CPU
-while driving: the game's vector code (how the VMX registers are kept between instructions), Wwise (~30 % of a core),
-the geometry hashing of the GPU command thread (~12 % of it).
+none, since checking a switch in every permute would add a branch to every game function that has one. Next: the
+CPU skinning of the cars (~15 % of the game threads), the visibility jobs, the GPU command thread's per-draw cost.
 
 ##  The native renderer
 
@@ -186,9 +192,8 @@ The profile belongs to that code: regenerate the game code and it has to be take
 ##  Roadmap
 
 1. **Performance to 30 fps** (measured with sys-clk; stock clocks are the floor):
-   - CPU, the limit while driving: the VMX translation of the game's vector code, Wwise's mixing, the GPU command
-     thread's per-draw cost and geometry hashing; a fresh PGO profile for the current code; more guest functions
-     without `volatile`;
+   - CPU, the limit while driving: the engine's jobs (car skinning, visibility, fog), Wwise's mixing, the GPU
+     command thread's per-draw cost; more guest functions without `volatile`;
    - GPU (30–35 ms): the remaining emulation overhead (resolve blits, stencil restores, full barriers) without
      changing the picture; depth written straight to the textures (MRT) without losing the small objects' shadows.
 2. **Rendering glitches**: lens flare through objects, garbled UI icons, glass shimmer.
